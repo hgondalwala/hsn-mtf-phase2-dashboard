@@ -17,6 +17,7 @@ Hard rules enforced here, structurally, not just by convention:
 - Read-only is enforced at the credential level (the role itself has no
   write grant on anything), not by this file's own discipline alone.
 """
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -200,6 +201,19 @@ def render_data_pipeline_status(snap: dict) -> None:
     c2.write("Quarantine warnings:"); c2.json(qw)
 
 
+def snapshot_identity_line(snap: dict) -> str:
+    """Snapshot parity footer -- operator ruling 2026-08-09 ("D. SNAPSHOT
+    PARITY -- REQUIRED ON BOTH SURFACES"). Canonical hash definition
+    identical to shadow_signal_output.compute_snapshot_identity() (the TG
+    renderer): SHA-256 over json.dumps(row, sort_keys=True,
+    separators=(',',':'), default=str) of the exact operating_state_latest
+    row this dashboard just queried -- same row, same hash, provable
+    parity with the TG digest, not just an assertion."""
+    payload = json.dumps(snap, sort_keys=True, separators=(",", ":"), default=str)
+    full_hash = hashlib.sha256(payload.encode()).hexdigest()
+    return f"snapshot id={snap['id']} · as_of={snap['as_of_date']} · sha256={full_hash[:12]}"
+
+
 def render_drill_down(snap: dict) -> None:
     """S7 -- collapsed by default, NOT above the fold. Read-only display
     of sealed records only."""
@@ -233,6 +247,7 @@ def main():
     render_drill_down(snap)         # S7, collapsed, not above the fold
 
     st.caption(f"Snapshot published: {snap['created_at']} | Auto-refresh every 60s on Streamlit Cloud.")
+    st.caption(snapshot_identity_line(snap))
 
 
 if __name__ == "__main__":
