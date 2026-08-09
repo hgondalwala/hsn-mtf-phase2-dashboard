@@ -51,7 +51,16 @@ def get_db_url() -> str:
 
 @st.cache_resource
 def get_connection(db_url: str):
-    return psycopg2.connect(db_url)
+    conn = psycopg2.connect(db_url)
+    # Real bug found 2026-08-09: this connection is cached across every
+    # Streamlit rerun for the app's lifetime. Without autocommit, each
+    # real SELECT leaves the session 'idle in transaction' indefinitely
+    # -- a real Supabase pooler connection held for as long as the app
+    # stays warm (observed: ~21 hours), contributing to real connection
+    # drops elsewhere. The role is read-only (no write grant exists at
+    # all), so autocommit is safe by construction, not just convenient.
+    conn.autocommit = True
+    return conn
 
 
 def load_latest_snapshot(db_url: str) -> dict | None:
