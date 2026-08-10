@@ -211,6 +211,48 @@ def load_previous_close_prices(db_url: str, symbols: list) -> dict:
     return {r[0]: float(r[2]) for r in rows}
 
 
+INTRADAY_SOURCE_LABEL = "Yahoo Finance delayed quote via yfinance"
+# Step 6P (operator ruling 2026-08-10): real, sealed minute-level
+# ladder for the intraday plane -- distinct from the EOD day-level
+# ladder above. During market hours a quote older than 15 minutes is
+# STALE; older than 60 minutes is EXPIRED and must be suppressed, not
+# shown as current.
+INTRADAY_STALE_MAX_MINUTES = 15
+INTRADAY_EXPIRED_MAX_MINUTES = 60
+
+
+def load_intraday_quotes(db_url: str, symbols: list) -> dict:
+    """Real, fresh-per-render read of quotes_latest (Step 6P). Display/
+    indicative only -- never used for signal, rank, or ledger marks.
+    Returns {symbol: {"price": float, "quote_ts": datetime, "source": str}}."""
+    if not symbols:
+        return {}
+    conn = get_connection(db_url)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT symbol, price, quote_ts, source FROM quotes_latest WHERE symbol = ANY(%s)",
+            (list(symbols),),
+        )
+        rows = cur.fetchall()
+    return {r[0]: {"price": float(r[1]), "quote_ts": r[2], "source": r[3]} for r in rows}
+
+
+def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
+    """Returns (status, age_minutes). FRESH/STALE/EXPIRED per the real
+    15min/60min ladder above. quote_ts=None -> STALE (no real quote to
+    classify), matching classify_price_freshness()'s own None handling."""
+    if quote_ts is None:
+        return "STALE", None
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    age_minutes = (now_utc - quote_ts).total_seconds() / 60.0
+    if age_minutes <= INTRADAY_STALE_MAX_MINUTES:
+        return "FRESH", age_minutes
+    if age_minutes <= INTRADAY_EXPIRED_MAX_MINUTES:
+        return "STALE", age_minutes
+    return "EXPIRED", age_minutes
+
+
 def classify_price_freshness(trade_date, today=None) -> tuple:
     """Returns (status, age_days). Reuses the real, sealed
     BHAVCOPY_FRESHNESS_PASS_DAYS=3/WARN_DAYS=7 thresholds."""
@@ -407,8 +449,12 @@ def _esc(s) -> str:
 # ---------------------------------------------------------------------------
 
 def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict,
-                             previous_prices: dict, run148_ref: dict) -> dict:
+                             previous_prices: dict, run148_ref: dict,
+                             intraday_quotes: dict | None = None, market_open: bool = False) -> dict:
+    intraday_quotes = intraday_quotes or {}
     ctx = {}
+    ctx["market_open"] = market_open
+    ctx["intraday_active"] = bool(intraday_quotes)
     display = HEALTH_STATUS_TO_DISPLAY.get(snap["health_status"], "UNKNOWN")
     ctx["display"] = display
     ctx["health_status"] = snap["health_status"]
@@ -529,11 +575,41 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         paper_action = (f"PAPER {act['intended_action'].replace('PAPER_', '')}" if act
                          else f"PAPER {r.get('action', 'HOLD')}")
         price_info = latest_prices.get(symbol)
-        last_price = price_info["close"] if price_info else None
-        freshness_status, age_days = classify_price_freshness(price_info["trade_date"] if price_info else None)
         signal_price = signal_prices.get(symbol)
         qty = pos.get("qty") if pos else None
         entry = pos.get("avg_cost") if pos else None
+
+        # Step 6P: prefer a real, non-expired intraday quote during
+        # market hours; otherwise fall back to the real EOD close,
+        # exactly the pre-6P behavior. Never a silent fallback to a
+        # stale/expired intraday value -- EXPIRED intraday quotes are
+        # suppressed (last=None), not shown as if current.
+        intraday = intraday_quotes.get(symbol)
+        is_intraday = False
+        if market_open and intraday:
+            i_status, i_age_min = classify_intraday_freshness(intraday["quote_ts"])
+            if i_status != "EXPIRED":
+                is_intraday = True
+                last_price = intraday["price"]
+                freshness_status = i_status
+                age_days = None
+                price_as_of_display = intraday["quote_ts"].astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+                source_display = INTRADAY_SOURCE_LABEL
+                age_minutes = i_age_min
+            else:
+                last_price = None  # EXPIRED -- suppressed, never shown as current
+                freshness_status = "EXPIRED"
+                age_days = None
+                price_as_of_display = intraday["quote_ts"].astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+                source_display = INTRADAY_SOURCE_LABEL
+                age_minutes = i_age_min
+        else:
+            last_price = price_info["close"] if price_info else None
+            freshness_status, age_days = classify_price_freshness(price_info["trade_date"] if price_info else None)
+            price_as_of_display = str(price_info["trade_date"]) if price_info else None
+            source_display = PRICE_SOURCE_LABEL if price_info else None
+            age_minutes = None
+
         value = (qty * last_price) if (qty and last_price is not None) else None
         pnl_inr_row = ((last_price - entry) * qty) if (qty and entry and last_price is not None) else None
         pnl_pct_row = (((last_price / entry) - 1) * 100) if (entry and last_price is not None) else None
@@ -541,9 +617,9 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             "symbol": symbol, "flag": flag, "rank": r.get("rank"),
             "band": _rank_band_subtext(r.get("rank")), "z": r.get("score"),
             "qty": qty, "entry": entry, "last": last_price, "signal": signal_price,
-            "price_as_of": str(price_info["trade_date"]) if price_info else None,
-            "source": PRICE_SOURCE_LABEL if price_info else None,
-            "age_days": age_days, "freshness": freshness_status,
+            "price_as_of": price_as_of_display, "source": source_display,
+            "age_days": age_days, "age_minutes": age_minutes, "freshness": freshness_status,
+            "is_intraday": is_intraday,
             "value": value, "pnl_inr": pnl_inr_row, "pnl_pct": pnl_pct_row,
             "weight": r.get("weight"), "paper_action": paper_action,
         })
@@ -555,17 +631,30 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     is_open, now_ist = _nse_market_open()
     market_phrase = "NSE market open" if is_open else "NSE market closed"
     next_update_phrase = _next_eod_update_phrase(now_ist)
-    # operator ruling 2026-08-10 ("B/C"): the dashboard must never present
-    # EOD bhavcopy as if it were live Last Rs, especially during real NSE
-    # market hours -- Step 6P (intraday/delayed quote plane) does not
-    # exist yet, so this is unconditionally true right now, every render.
-    intraday_active = False
-    disclosure = ("EOD close only — intraday LTP not yet active" if not intraday_active
-                  else "intraday quote plane active")
-    if oldest is None:
+
+    # Step 6P (operator ruling 2026-08-10): intraday is "really active"
+    # for this render only if at least one row actually resolved to a
+    # real, non-expired intraday quote -- not merely "the poller has
+    # ever run" or "quotes_latest is non-empty". A stale/expired-only
+    # intraday plane must still read as EOD_ONLY-class, never claim LIVE.
+    n_intraday_rows = sum(1 for row in rows if row["is_intraday"])
+    n_intraday_expired = sum(1 for row in rows if row["freshness"] == "EXPIRED")
+    intraday_really_active = n_intraday_rows > 0
+    disclosure = ("Yahoo Finance delayed intraday quotes active (display/indicative only)"
+                  if intraday_really_active else "EOD close only — intraday LTP not yet active")
+
+    if oldest is None and not intraday_really_active:
         ctx["freshness_banner_status"] = "STALE"
         ctx["freshness_banner_text"] = ("PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
                                           f"{disclosure} · {market_phrase}.")
+    elif intraday_really_active:
+        worst_status = "EXPIRED" if n_intraday_expired else ("STALE" if ctx["n_stale"] else "FRESH")
+        ctx["freshness_banner_status"] = "STALE" if worst_status == "EXPIRED" else worst_status
+        ctx["freshness_banner_text"] = (
+            f"{disclosure} · {n_intraday_rows}/{ctx['n_symbols']} symbols live "
+            f"({n_intraday_expired} expired, suppressed) · {market_phrase} · Source: {INTRADAY_SOURCE_LABEL} "
+            f"· EOD reference: {ctx['latest_bhavcopy_date']} (signal/rank/ledger basis, unchanged)"
+        )
     else:
         worst_status = "STALE" if ctx["n_stale"] else ("DELAYED" if oldest > PRICE_FRESH_MAX_DAYS else "FRESH")
         # amber EOD_ONLY treatment overrides the day-count-based color
@@ -574,7 +663,7 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         # reading as "FRESH" during Monday market hours is technically
         # correct by the day-count threshold but misleading to an
         # operator watching a live market).
-        banner_status = "EOD_ONLY" if (is_open and not intraday_active) else worst_status
+        banner_status = "EOD_ONLY" if is_open else worst_status
         ctx["freshness_banner_status"] = banner_status
         ctx["freshness_banner_text"] = (
             f"EOD close {newest_date} · {market_phrase} · {disclosure} · {next_update_phrase} "
@@ -777,6 +866,7 @@ tbody td.pxcell{white-space:nowrap}
 .fchip.FRESH{background:rgba(34,197,94,.14);color:var(--green)}
 .fchip.DELAYED{background:rgba(245,158,11,.14);color:var(--amber)}
 .fchip.STALE{background:rgba(239,68,68,.14);color:var(--red)}
+.fchip.EXPIRED{background:rgba(239,68,68,.22);color:var(--red);text-decoration:line-through}
 @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.grid2,.grid3,.dd-body,.issue-grid,.hero-grid{grid-template-columns:1fr}.pipewrap{grid-template-columns:repeat(2,1fr)}.exc{border-left:none;border-top:1px solid var(--border)}.dec-grid{grid-template-columns:repeat(2,auto)}}
 """
 
@@ -814,8 +904,16 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         ovl = "overlap" if row["flag"] else ""
         symflag = f"<span class='symflag tag-ovl'>{_esc(row['flag'])}</span>" if row["flag"] else ""
         band = f"<span class='ranksub'>{_esc(row['band'])}</span>" if row["band"] else ""
+        # Step 6P: EXPIRED intraday quotes are suppressed -- never shown
+        # as if current, even though a real quote_ts exists (row["last"]
+        # is None for that case, set upstream in build_dashboard_context).
         last_display = f"{row['last']:.2f}" if row["last"] is not None else "—"
-        if row["price_as_of"]:
+        if row["is_intraday"] or row["freshness"] == "EXPIRED" and row["price_as_of"]:
+            age_txt = f"{row['age_minutes']:.0f} min old" if row.get("age_minutes") is not None else ""
+            tooltip = f"{_esc(row['source'])} · {_esc(row['price_as_of'])} · {age_txt}"
+            short_label = row["price_as_of"][11:16] if len(row["price_as_of"]) > 15 else row["price_as_of"]
+            as_of = f" <span class='fchip {_esc(row["freshness"])}' title='{tooltip}'>{short_label}</span>"
+        elif row["price_as_of"]:
             short_date = row["price_as_of"][8:10] + "-" + \
                 {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
                  "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}[row["price_as_of"][5:7]]
@@ -1331,16 +1429,23 @@ def main():
 
     tb_symbols = [r.get("symbol") for r in (_jsonb(snap["target_book"]) or [])]
     price_t0 = time.monotonic()
+    market_open, _now_ist = _nse_market_open()
     try:
         latest_prices = load_latest_prices(db_url, tb_symbols) if not is_stale_fallback else {}
         signal_prices = load_signal_date_prices(db_url, tb_symbols, snap["as_of_date"]) if not is_stale_fallback else {}
         previous_prices = load_previous_close_prices(db_url, tb_symbols) if not is_stale_fallback else {}
+        # Step 6P: only bother polling quotes_latest when the market is
+        # actually open -- outside market hours the intraday plane is
+        # never "really active" regardless (build_dashboard_context falls
+        # back to EOD-only), so skip the extra real DB round-trip.
+        intraday_quotes = load_intraday_quotes(db_url, tb_symbols) if (not is_stale_fallback and market_open) else {}
     except Exception:
-        latest_prices, signal_prices, previous_prices = {}, {}, {}
+        latest_prices, signal_prices, previous_prices, intraday_quotes = {}, {}, {}, {}
     price_load_seconds = time.monotonic() - price_t0
 
     run148_ref = load_run148_reference()
-    ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref)
+    ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref,
+                                    intraday_quotes=intraday_quotes, market_open=market_open)
     html = render_dash3_html(ctx, dev_mode=False)
     if is_stale_fallback:
         html = html.replace('<div class="cmdstrip">',
