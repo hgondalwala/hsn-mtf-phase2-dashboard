@@ -147,6 +147,17 @@ def load_latest_snapshot(db_url: str):
             conn.rollback()
         except Exception:
             pass
+        # Real bug found 2026-08-10: st.cache_resource caches this
+        # connection for the whole app process lifetime; if the real
+        # Supabase pooler drops it (the same class of connection-drop
+        # already documented in FAILURES.md for long-held sessions), every
+        # subsequent rerun kept reusing the same dead connection object --
+        # permanently broken until a full process restart, with no real
+        # recovery path even for a brand-new visitor with no last-good
+        # snapshot cached yet. Clearing the cache here means the NEXT
+        # rerun opens a fresh real connection instead of retrying a
+        # connection already known to be dead.
+        get_connection.clear()
         return None, time.monotonic() - t0, str(exc)
 
 
@@ -333,6 +344,25 @@ def _indian_rupee(n, decimals=0) -> str:
     return out
 
 
+def _freshness_phrase(status: str, trade_date, age_days) -> str:
+    """Trading-calendar-aware freshness wording (operator ruling
+    2026-08-10): raw calendar-day age read as misleading next to FRESH
+    ("3 day(s) · FRESH" reads wrong even though it's correct once a
+    weekend is in the gap -- Friday close is still the honest current
+    EOD mark on Monday morning, before that day's own close exists).
+    Describes the real relationship to the next session instead of a
+    bare day-count. The underlying FRESH/DELAYED/STALE classification
+    (PRICE_FRESH_MAX_DAYS/PRICE_DELAYED_MAX_DAYS) is unchanged -- this
+    only changes what age_days is presented as, never suppresses it."""
+    if trade_date is None:
+        return "no real bhavcopy row found"
+    if status == "FRESH":
+        return f"EOD close {trade_date} · fresh until next NSE session"
+    if status == "DELAYED":
+        return f"EOD close {trade_date} · {age_days} calendar days old · delayed, next session pending"
+    return f"EOD close {trade_date} · {age_days} calendar days old · STALE"
+
+
 def _esc(s) -> str:
     """Minimal HTML-escape for real text values interpolated into the
     static (non-JS-JSON) parts of the page -- never raw-injects a real
@@ -481,8 +511,8 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         worst_status = "STALE" if ctx["n_stale"] else ("DELAYED" if oldest > PRICE_FRESH_MAX_DAYS else "FRESH")
         ctx["freshness_banner_status"] = worst_status
         ctx["freshness_banner_text"] = (
-            f"Prices current as of: {newest_date} · Oldest price age: {oldest} day(s) · "
-            f"Source: {PRICE_SOURCE_LABEL} · Status: {worst_status}"
+            f"{_freshness_phrase(worst_status, newest_date, oldest)} · Source: {PRICE_SOURCE_LABEL} · "
+            f"Status: {worst_status}"
         )
 
     # top movers -- real day-over-day
@@ -713,7 +743,8 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         symflag = f"<span class='symflag tag-ovl'>{_esc(row['flag'])}</span>" if row["flag"] else ""
         band = f"<span class='ranksub'>{_esc(row['band'])}</span>" if row["band"] else ""
         last_display = f"{row['last']:.2f}" if row["last"] is not None else "—"
-        as_of = f" <span class='ranksub'>as of {_esc(row['price_as_of'])} · {row['age_days']}d · {_esc(row['freshness'])}</span>" if row["price_as_of"] else ""
+        as_of = (f" <span class='ranksub'>{_esc(_freshness_phrase(row['freshness'], row['price_as_of'], row['age_days']))}"
+                 f" · {_esc(row['freshness'])}</span>" if row["price_as_of"] else "")
         signal_display = f"{row['signal']:.2f}" if row["signal"] is not None else "—"
         if has_real_fills and row["qty"]:
             qty_d, entry_d = f"{row['qty']:.0f}", f"{row['entry']:.2f}"
@@ -823,6 +854,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
 </div>"""
 
     freshbar_html = f"""<div class="freshbar {ctx['freshness_banner_status']}">{_esc(ctx['freshness_banner_text'])}</div>"""
+    snapshot_stale_html = _snapshot_freshness_banner_html(ctx)
 
     export_bar_html = f"""
 <div class="export-bar">
@@ -1091,6 +1123,7 @@ tick(); setInterval(tick,1000);
   <div class="clock" id="clock"></div>
 </div>
 <div class="hero {hero_cls}" id="hero">{hero_inner}</div>
+{snapshot_stale_html}
 {kpis_html}
 {freshbar_html}
 {export_bar_html}
@@ -1140,6 +1173,40 @@ _DEV_HALT_PREVIEW_SNAPSHOT = {
 }
 
 
+# Startup contract (operator ruling 2026-08-10, "A. STARTUP CONTRACT"):
+# the very first paint must never be Streamlit's own bare white/spinner
+# default -- a minimal, dark-themed, on-brand shell renders immediately,
+# before any DB round-trip, and is replaced once real data (or a real
+# last-good fallback) is ready. Deliberately tiny (no ECharts, no data)
+# so it paints instantly regardless of Supabase latency.
+_LOADING_SHELL_HTML = f"""<!DOCTYPE html><html><head><style>{DASH3_CSS}</style></head>
+<body><div class="cmdstrip"><div class="shadow-warn">⛔ SHADOW ONLY — READ-ONLY INTERFACE — NO EXECUTION PATH EXISTS</div></div>
+<div class="topbar"><div><div class="brand">HSN S1 MOMENTUM TERMINAL</div>
+<div class="brandmode">Mode: <b>SHADOW / PAPER</b></div></div></div>
+<div class="hero exception"><div class="hero-main" style="padding:40px 24px;text-align:center">
+<div class="usable-big u-amber">LOADING REAL SNAPSHOT…</div>
+<div class="hero-note" style="margin-top:14px">Querying operating_state_latest (read-only) — this is not a fault, the page updates automatically once the query returns.</div>
+</div></div></body></html>"""
+
+
+def _snapshot_freshness_banner_html(ctx: dict) -> str:
+    """Snapshot-level staleness (distinct from per-price freshness,
+    S3/addendum item A): reuses the same real, sealed PRICE_FRESH_MAX_DAYS/
+    PRICE_DELAYED_MAX_DAYS thresholds against the snapshot's own
+    as_of_date -- not a new invented number. Empty string if fresh."""
+    try:
+        as_of = datetime.strptime(ctx["as_of_date"], "%Y-%m-%d").date()
+    except (ValueError, KeyError):
+        return ""
+    age = (datetime.now(timezone.utc).date() - as_of).days
+    if age <= PRICE_FRESH_MAX_DAYS:
+        return ""
+    status = "STALE" if age > PRICE_DELAYED_MAX_DAYS else "DELAYED"
+    return (f'<div class="freshbar {status}">DATA STALE — this snapshot\'s as_of_date ({ctx["as_of_date"]}) '
+            f'is {age} calendar days old. No newer real pipeline cycle has published yet. '
+            f'Signal/capital status remains conservative regardless.</div>')
+
+
 def main():
     st.set_page_config(page_title="Phase 2 Shadow Operating Dashboard", layout="wide")
     # DEV preview is URL-only (?dev=1) -- never a visible sidebar control
@@ -1156,22 +1223,29 @@ def main():
                  "Remove ?dev=1 from the URL to see the real live snapshot.")
         return
 
+    shell = st.empty()
+    with shell.container():
+        components.html(_LOADING_SHELL_HTML, height=260, scrolling=False)
+
     db_url = get_db_url()
     if not db_url:
+        shell.empty()
         st.error("PHASE2_DASHBOARD_READONLY_DATABASE_URL is not configured (Streamlit secrets or environment).")
         return
 
+    is_stale_fallback = False
     snap, load_seconds, error = load_latest_snapshot(db_url)
     if error:
         last_good = st.session_state.get("last_good_snapshot")
         if last_good:
-            st.error(f"Live query failed (real error: {error[:200]}). Showing last-good snapshot from this "
-                     f"session -- may be DATA STALE.")
             snap = last_good
+            is_stale_fallback = True
         else:
+            shell.empty()
             st.error(f"Live query failed and no last-good snapshot is cached this session (real error: {error[:200]}).")
             return
     elif snap is None:
+        shell.empty()
         st.warning("No operating_state_snapshot row found yet -- pipeline has not published a real snapshot.")
         return
     else:
@@ -1179,18 +1253,29 @@ def main():
 
     tb_symbols = [r.get("symbol") for r in (_jsonb(snap["target_book"]) or [])]
     price_t0 = time.monotonic()
-    latest_prices = load_latest_prices(db_url, tb_symbols)
-    signal_prices = load_signal_date_prices(db_url, tb_symbols, snap["as_of_date"])
-    previous_prices = load_previous_close_prices(db_url, tb_symbols)
+    try:
+        latest_prices = load_latest_prices(db_url, tb_symbols) if not is_stale_fallback else {}
+        signal_prices = load_signal_date_prices(db_url, tb_symbols, snap["as_of_date"]) if not is_stale_fallback else {}
+        previous_prices = load_previous_close_prices(db_url, tb_symbols) if not is_stale_fallback else {}
+    except Exception:
+        latest_prices, signal_prices, previous_prices = {}, {}, {}
     price_load_seconds = time.monotonic() - price_t0
 
     run148_ref = load_run148_reference()
     ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref)
     html = render_dash3_html(ctx, dev_mode=False)
+    if is_stale_fallback:
+        html = html.replace('<div class="cmdstrip">',
+                             f'<div class="freshbar STALE">DATA STALE — live query failed (real error: '
+                             f'{_esc(error[:150])}). Showing last-good snapshot from this session; prices not '
+                             f're-queried. Signal/capital status remains conservative regardless.</div>'
+                             f'<div class="cmdstrip">', 1)
+    shell.empty()
     components.html(html, height=2600, scrolling=True)
 
     st.caption(f"Load time this render: {load_seconds:.2f}s (snapshot) + {price_load_seconds:.2f}s (real prices) "
-               f"| DEV preview available via ?dev=1 (not visible in normal navigation).")
+               f"| DEV preview available via ?dev=1 (not visible in normal navigation)."
+               + (" | STALE FALLBACK IN USE." if is_stale_fallback else ""))
 
 
 if __name__ == "__main__":
