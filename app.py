@@ -54,7 +54,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 import psycopg2
@@ -344,6 +344,32 @@ def _indian_rupee(n, decimals=0) -> str:
     return out
 
 
+IST = timezone(timedelta(hours=5, minutes=30))
+NSE_OPEN, NSE_CLOSE = dtime(9, 15), dtime(15, 30)
+
+
+def _nse_market_open(now_ist=None) -> tuple:
+    """Real weekday+clock-time check (no holiday calendar -- disclosed,
+    not fabricated as exhaustive). Returns (is_open, now_ist)."""
+    if now_ist is None:
+        now_ist = datetime.now(IST)
+    is_open = now_ist.weekday() < 5 and NSE_OPEN <= now_ist.time() <= NSE_CLOSE
+    return is_open, now_ist
+
+
+def _next_eod_update_phrase(now_ist) -> str:
+    """Real, honest description of when the NEXT bhavcopy publish is
+    expected -- EOD bhavcopy publishes after real market close, real
+    weekday-only, no live intraday feed exists yet (6P not built)."""
+    is_open, _ = _nse_market_open(now_ist)
+    today_str = now_ist.date().isoformat()
+    if is_open:
+        return f"next EOD update expected after {today_str} close (~18:30 IST)"
+    if now_ist.weekday() < 5 and now_ist.time() < NSE_OPEN:
+        return f"next EOD update expected after {today_str} close (~18:30 IST)"
+    return f"next EOD update expected after the next real NSE trading day's close"
+
+
 def _freshness_phrase(status: str, trade_date, age_days) -> str:
     """Trading-calendar-aware freshness wording (operator ruling
     2026-08-10): raw calendar-day age read as misleading next to FRESH
@@ -446,6 +472,28 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     worst_gates = [g for g in gates if GATE_STATUS_ORDER.get(g.get("status"), 9) == worst_rank]
     ctx["worst_gate_status"] = worst_gates[0]["status"] if worst_gates else "PASS"
     ctx["worst_gate_name"] = worst_gates[0]["gate"] if worst_gates else "n/a"
+    # segmented gate counts (operator ruling 2026-08-10, "E. GAUGE LABEL":
+    # bare "7/13" is ambiguous -- show what the 7 and the 6 non-pass
+    # actually break down as). REVIEW buckets FLAGGED/REVIEW-class
+    # statuses; OTHER buckets real statuses the mock's own illustration
+    # never anticipated (INSUFFICIENT_HISTORY, BOUNDED_PROXY_ONLY) --
+    # disclosed as their own real bucket, not silently folded into WARN.
+    seg = {"PASS": 0, "WARN": 0, "REVIEW": 0, "FAIL": 0, "OTHER": 0}
+    for g in gates:
+        st_ = g.get("status")
+        if st_ == "PASS":
+            seg["PASS"] += 1
+        elif st_ == "WARN":
+            seg["WARN"] += 1
+        elif st_ in ("FLAGGED", "REVIEW"):
+            seg["REVIEW"] += 1
+        elif st_ == "FAIL":
+            seg["FAIL"] += 1
+        else:
+            seg["OTHER"] += 1
+    ctx["gate_segments"] = seg
+    ctx["gate_segments_line"] = " · ".join(
+        f"{k} {v}" for k, v in seg.items() if v > 0)
 
     ctx["pipeline"] = [
         ("ca_watch", snap["ca_watch_status"]), ("asm_gsm_watch", snap["asm_gsm_status"]),
@@ -504,15 +552,33 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
 
     oldest = max((row["age_days"] for row in rows if row["age_days"] is not None), default=None)
     newest_date = max((row["price_as_of"] for row in rows if row["price_as_of"]), default=None)
+    is_open, now_ist = _nse_market_open()
+    market_phrase = "NSE market open" if is_open else "NSE market closed"
+    next_update_phrase = _next_eod_update_phrase(now_ist)
+    # operator ruling 2026-08-10 ("B/C"): the dashboard must never present
+    # EOD bhavcopy as if it were live Last Rs, especially during real NSE
+    # market hours -- Step 6P (intraday/delayed quote plane) does not
+    # exist yet, so this is unconditionally true right now, every render.
+    intraday_active = False
+    disclosure = ("EOD close only — intraday LTP not yet active" if not intraday_active
+                  else "intraday quote plane active")
     if oldest is None:
         ctx["freshness_banner_status"] = "STALE"
-        ctx["freshness_banner_text"] = "PRICE DATA STALE — no real bhavcopy row found for any target-book symbol."
+        ctx["freshness_banner_text"] = ("PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
+                                          f"{disclosure} · {market_phrase}.")
     else:
         worst_status = "STALE" if ctx["n_stale"] else ("DELAYED" if oldest > PRICE_FRESH_MAX_DAYS else "FRESH")
-        ctx["freshness_banner_status"] = worst_status
+        # amber EOD_ONLY treatment overrides the day-count-based color
+        # whenever the market is genuinely open right now -- that is
+        # precisely the scenario the ruling flagged (Friday's close
+        # reading as "FRESH" during Monday market hours is technically
+        # correct by the day-count threshold but misleading to an
+        # operator watching a live market).
+        banner_status = "EOD_ONLY" if (is_open and not intraday_active) else worst_status
+        ctx["freshness_banner_status"] = banner_status
         ctx["freshness_banner_text"] = (
-            f"{_freshness_phrase(worst_status, newest_date, oldest)} · Source: {PRICE_SOURCE_LABEL} · "
-            f"Status: {worst_status}"
+            f"EOD close {newest_date} · {market_phrase} · {disclosure} · {next_update_phrase} "
+            f"· Source: {PRICE_SOURCE_LABEL} · Age: {oldest} calendar day(s) ({worst_status} by day-count)"
         )
 
     # top movers -- real day-over-day
@@ -705,6 +771,12 @@ details.panel summary .sumline .w2{color:var(--amber)}
 .freshbar.FRESH{border-left:3px solid var(--green);color:var(--dim)}
 .freshbar.DELAYED{border-left:3px solid var(--amber);color:var(--dim)}
 .freshbar.STALE{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
+.freshbar.EOD_ONLY{border-left:3px solid var(--amber);background:rgba(245,158,11,.06);color:var(--text)}
+tbody td.pxcell{white-space:nowrap}
+.fchip{display:inline-block;font-size:7.5px;font-weight:700;padding:1px 4px;border-radius:2px;margin-left:5px;letter-spacing:.3px;vertical-align:middle}
+.fchip.FRESH{background:rgba(34,197,94,.14);color:var(--green)}
+.fchip.DELAYED{background:rgba(245,158,11,.14);color:var(--amber)}
+.fchip.STALE{background:rgba(239,68,68,.14);color:var(--red)}
 @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.grid2,.grid3,.dd-body,.issue-grid,.hero-grid{grid-template-columns:1fr}.pipewrap{grid-template-columns:repeat(2,1fr)}.exc{border-left:none;border-top:1px solid var(--border)}.dec-grid{grid-template-columns:repeat(2,auto)}}
 """
 
@@ -743,8 +815,15 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         symflag = f"<span class='symflag tag-ovl'>{_esc(row['flag'])}</span>" if row["flag"] else ""
         band = f"<span class='ranksub'>{_esc(row['band'])}</span>" if row["band"] else ""
         last_display = f"{row['last']:.2f}" if row["last"] is not None else "—"
-        as_of = (f" <span class='ranksub'>{_esc(_freshness_phrase(row['freshness'], row['price_as_of'], row['age_days']))}"
-                 f" · {_esc(row['freshness'])}</span>" if row["price_as_of"] else "")
+        if row["price_as_of"]:
+            short_date = row["price_as_of"][8:10] + "-" + \
+                {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+                 "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}[row["price_as_of"][5:7]]
+            as_of = (f" <span class='fchip {_esc(row["freshness"])}' title='"
+                     f"{_esc(_freshness_phrase(row["freshness"], row["price_as_of"], row["age_days"]))}"
+                     f"'>{short_date}</span>")
+        else:
+            as_of = ""
         signal_display = f"{row['signal']:.2f}" if row["signal"] is not None else "—"
         if has_real_fills and row["qty"]:
             qty_d, entry_d = f"{row['qty']:.0f}", f"{row['entry']:.2f}"
@@ -849,7 +928,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
   <div class="kpi"><div class="label">Paper P&amp;L</div><div class="value {ctx['pnl_class']}">{ctx['pnl_display']}</div><div class="sub">{_esc(ctx['pnl_sub'])} · since {_esc(ctx['as_of_date'])}</div></div>
   <div class="kpi"><div class="label">Positions</div><div class="value">{ctx['n_positions']}</div><div class="sub">{ctx['n_symbols']} in book</div></div>
   <div class="kpi"><div class="label">Drawdown</div><div class="value flat">0.00%</div><div class="sub">ref MaxDD {ctx['run148']['max_drawdown']*100:.2f}% (run_148)</div></div>
-  <div class="kpi"><div class="label">Health (secondary)</div><div class="value sm {kpi_health_cls}">{n_pass}/{n_gates} pass</div><div class="sub">worst: {_esc(ctx['worst_gate_status'])} ({_esc(ctx['worst_gate_name'])})</div></div>
+  <div class="kpi"><div class="label">Health (secondary)</div><div class="value sm {kpi_health_cls}">Clean gates: {n_pass}/{n_gates}</div><div class="sub">{_esc(ctx['gate_segments_line'])}</div></div>
   <div class="kpi"><div class="label">Material Issues</div><div class="value sm {'up' if ctx['material_issue_count']==0 else 'orng'}">{ctx['material_issue_count']}</div><div class="sub">{ctx['material_issue_count']} material to book/signal</div></div>
 </div>"""
 
@@ -925,11 +1004,9 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
 </div>"""
 
     gate_rows_html = "".join(_gate_row_html(g) for g in ctx["gates"])
-    worst_summary = (f"<b>{ctx['worst_gate_name']}: {ctx['worst_gate_status']}</b>"
-                      if ctx["worst_gate_status"] != "PASS" else "all PASS")
     health_html = f"""
 <details class="panel">
-  <summary>System Health — Tier-2 gates <span class="sumline">{n_pass}/{n_gates} pass · {worst_summary}</span><span class="arrow">▶</span></summary>
+  <summary>System Health — Tier-2 gates <span class="sumline">Clean gates: {n_pass}/{n_gates} · {_esc(ctx['gate_segments_line'])}</span><span class="arrow">▶</span></summary>
   <div class="grid2" style="padding:0">
     <div><table><thead><tr><th>Gate</th><th>Status</th><th>Measured</th><th>Detail</th></tr></thead>
       <tbody>{gate_rows_html}</tbody></table></div>
@@ -1079,8 +1156,9 @@ const MOVES={moves_json};
       axisTick:{{distance:-15,length:4,lineStyle:{{color:'#0b0e14',width:1}}}},
       splitLine:{{distance:-15,length:15,lineStyle:{{color:'#0b0e14',width:2}}}},
       axisLabel:{{color:'#5a6377',fontFamily:'JetBrains Mono',fontSize:9,distance:22}},
+      title:{{show:true,offsetCenter:[0,'32%'],color:'#8b93a5',fontFamily:'JetBrains Mono',fontSize:9.5}},
       detail:{{valueAnimation:true,offsetCenter:[0,'60%'],color:'#f97316',fontFamily:'JetBrains Mono',fontSize:19,fontWeight:700,formatter:'{{value}} / {n_gates_json}'}},
-      data:[{{value:{n_gates_pass_json},name:'passing'}}]}}]}});
+      data:[{{value:{n_gates_pass_json},name:'Clean gates'}}]}}]}});
 }})();
 
 let ddInit=false;
