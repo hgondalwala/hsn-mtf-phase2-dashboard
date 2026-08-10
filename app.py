@@ -253,6 +253,41 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
     return "EXPIRED", age_minutes
 
 
+# Build-identity footer (operator ruling 2026-08-10, item C): Streamlit
+# Cloud does not inject a git SHA at runtime and this deploy repo is a
+# separate, code-only mirror (no .git directory ships with it) -- so a
+# real commit hash cannot be read at import time. Instead this uses a
+# real, verifiable, self-computed fingerprint: the SHA256 of this very
+# file's own bytes as loaded by the running process. If the deployed
+# app is serving stale code, this hash will not match the hash of the
+# file actually pushed -- a real, checkable signal, not a hardcoded claim.
+_BUILD_TAG = "step6p-v1"
+_BUILD_TIMESTAMP_IST = "2026-08-10 16:30 IST"
+
+
+def _self_source_fingerprint() -> str:
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except Exception:
+        return "unavailable"
+
+
+def load_quotes_latest_health(db_url: str) -> dict:
+    """Real, cheap, always-on (not market-hours-gated) reachability
+    check for quotes_latest -- independent of load_intraday_quotes()
+    (which only runs during market hours for the actual row data).
+    Used only for the build-identity footer disclosure."""
+    try:
+        conn = get_connection(db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*), max(quote_ts) FROM quotes_latest")
+            count, latest_ts = cur.fetchone()
+        return {"reachable": True, "count": count, "latest_quote_ts": str(latest_ts) if latest_ts else None,
+                "error": None}
+    except Exception as exc:
+        return {"reachable": False, "count": None, "latest_quote_ts": None, "error": str(exc)[:200]}
+
+
 def classify_price_freshness(trade_date, today=None) -> tuple:
     """Returns (status, age_days). Reuses the real, sealed
     BHAVCOPY_FRESHNESS_PASS_DAYS=3/WARN_DAYS=7 thresholds."""
@@ -450,11 +485,17 @@ def _esc(s) -> str:
 
 def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict,
                              previous_prices: dict, run148_ref: dict,
-                             intraday_quotes: dict | None = None, market_open: bool = False) -> dict:
+                             intraday_quotes: dict | None = None, market_open: bool = False,
+                             quotes_health: dict | None = None) -> dict:
     intraday_quotes = intraday_quotes or {}
     ctx = {}
     ctx["market_open"] = market_open
     ctx["intraday_active"] = bool(intraday_quotes)
+    ctx["quotes_health"] = quotes_health or {"reachable": False, "count": None, "latest_quote_ts": None, "error": None}
+    ctx["build_tag"] = _BUILD_TAG
+    ctx["build_timestamp"] = _BUILD_TIMESTAMP_IST
+    ctx["build_fingerprint"] = _self_source_fingerprint()
+    ctx["build_app_path"] = str(Path(__file__).resolve())
     display = HEALTH_STATUS_TO_DISPLAY.get(snap["health_status"], "UNKNOWN")
     ctx["display"] = display
     ctx["health_status"] = snap["health_status"]
@@ -1150,12 +1191,23 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
   </div>
 </details>"""
 
+    qh = ctx["quotes_health"]
+    qh_display = (f"reachable=True · count={qh['count']} · latest_quote_ts={qh['latest_quote_ts']}"
+                  if qh["reachable"] else f"reachable=False · error={qh['error']}")
+    build_html = (
+        f'<span>build: {_esc(ctx["build_tag"])} · fingerprint {_esc(ctx["build_fingerprint"])} · '
+        f'built {_esc(ctx["build_timestamp"])}</span>'
+        f'<span>app path: {_esc(ctx["build_app_path"])}</span>'
+        f'<span>6P enabled: True · quote source: {_esc(INTRADAY_SOURCE_LABEL)}</span>'
+        f'<span>quotes_latest: {_esc(qh_display)}</span>'
+    )
     footer_html = f"""
 <div class="footer">
   <span class="warn">READ-ONLY ENFORCED AT CREDENTIAL LEVEL — no broker · no MTF · no approval buttons · no edit controls · no config changes</span>
   <span>snapshot: operating_state_latest @ {_esc(ctx['created_at'])}</span>
   <span>TG digest = same snapshot row, same renderer</span>
   <span>{_esc(ctx['identity_line'])}</span>
+  {build_html}
 </div>"""
 
     devflag_html = '<div class="devflag">DEV MODE — synthetic-data indicator (URL ?dev=1)</div>' if dev_mode else ""
@@ -1443,9 +1495,17 @@ def main():
         latest_prices, signal_prices, previous_prices, intraday_quotes = {}, {}, {}, {}
     price_load_seconds = time.monotonic() - price_t0
 
+    # Build-identity footer diagnostic (operator ruling 2026-08-10, item
+    # C): always attempted, independent of market hours and of the main
+    # try/except above -- a failure here must never blank out the real
+    # snapshot render, only the footer's own quotes_latest line.
+    quotes_health = load_quotes_latest_health(db_url) if not is_stale_fallback else \
+        {"reachable": False, "count": None, "latest_quote_ts": None, "error": "stale fallback render"}
+
     run148_ref = load_run148_reference()
     ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref,
-                                    intraday_quotes=intraday_quotes, market_open=market_open)
+                                    intraday_quotes=intraday_quotes, market_open=market_open,
+                                    quotes_health=quotes_health)
     html = render_dash3_html(ctx, dev_mode=False)
     if is_stale_fallback:
         html = html.replace('<div class="cmdstrip">',
