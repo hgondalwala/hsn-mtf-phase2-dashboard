@@ -67,13 +67,23 @@ RANK_BAND_EDGE_BUFFER = 50
 # Real, already-sealed thresholds reused verbatim from readiness_certification.py's
 # evaluate_gate_bhavcopy_freshness() (BHAVCOPY_FRESHNESS_PASS_DAYS/WARN_DAYS) --
 # not new arbitrary numbers. Age is real calendar days since the latest real
-# bhavcopy trade_date per symbol (this system has no intraday feed, see module
-# docstring), never minutes. (6P's intraday minute-level ladder is a separate,
-# not-yet-built price plane -- see PHASE2_DASH_LIVE_PRICE_FRESHNESS_ADDENDUM.md
-# Section 3 for its 15min/60min bounds, which apply once quotes_latest exists.)
+# bhavcopy trade_date per symbol -- the EOD/day-count ladder below, separate
+# from Step 6P's real intraday minute-level ladder
+# (INTRADAY_STALE_MAX_MINUTES/INTRADAY_EXPIRED_MAX_MINUTES) which governs
+# quotes_latest freshness once a row actually resolves to a real intraday
+# quote (see PHASE2_DASH_LIVE_PRICE_FRESHNESS_ADDENDUM.md Section 3).
 PRICE_FRESH_MAX_DAYS = 3
 PRICE_DELAYED_MAX_DAYS = 7
-PRICE_SOURCE_LABEL = "NSE bhavcopy (EOD close, real ingest -- no intraday feed exists in this system)"
+# R16 (operator ruling 2026-08-10): PRICE_SOURCE_LABEL describes the
+# bhavcopy FILE's own granularity (it is an EOD file, always was) -- it
+# must never claim anything about whether THIS SYSTEM has an intraday
+# feed. That claim is Step 6P's, and it now exists; it belongs solely in
+# the freshness banner text below, which already differentiates
+# active/degraded/closed. The old wording ("...no intraday feed exists
+# in this system") read as a system-wide claim and went stale the
+# moment 6P shipped, even though this label's own EOD-source meaning
+# never changed.
+PRICE_SOURCE_LABEL = "NSE bhavcopy (EOD close, real ingest)"
 
 HEALTH_STATUS_TO_DISPLAY = {
     "HEALTHY_FOR_SHADOW_SIGNAL": "GREEN",
@@ -262,7 +272,17 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 # app is serving stale code, this hash will not match the hash of the
 # file actually pushed -- a real, checkable signal, not a hardcoded claim.
 _BUILD_TAG = "step6p-v1"
-_BUILD_TIMESTAMP_IST = "2026-08-10 16:30 IST"
+_BUILD_TIMESTAMP_IST = "2026-08-10 17:30 IST"
+
+# R13 (operator ruling 2026-08-10): the public URL was previously not
+# recorded anywhere, causing a real verification gap mid-investigation
+# -- this repo cannot import phase2/deployment_config.py (it ships
+# standalone, no .git, no package structure; see the module docstring
+# for why every other constant here is reproduced rather than
+# imported), so the same literal value is the tracked source of truth
+# on this side. Must always match PUBLIC_DASHBOARD_URL in
+# phase2/deployment_config.py in the main repo.
+PUBLIC_DASHBOARD_URL = "https://hsnmtfphase2dashboard.streamlit.app/"
 
 
 def _self_source_fingerprint() -> str:
@@ -437,7 +457,9 @@ def _nse_market_open(now_ist=None) -> tuple:
 def _next_eod_update_phrase(now_ist) -> str:
     """Real, honest description of when the NEXT bhavcopy publish is
     expected -- EOD bhavcopy publishes after real market close, real
-    weekday-only, no live intraday feed exists yet (6P not built)."""
+    weekday-only. Describes the EOD/signal-basis plane only; Step 6P's
+    separate intraday plane has its own resume time (09:15 IST next
+    session), surfaced by the freshness banner, not here."""
     is_open, _ = _nse_market_open(now_ist)
     today_str = now_ist.date().isoformat()
     if is_open:
@@ -627,6 +649,14 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         # suppressed (last=None), not shown as if current.
         intraday = intraday_quotes.get(symbol)
         is_intraday = False
+        # WELCORP-bug follow-up (operator ruling 2026-08-10): market is
+        # open, but this target-book symbol has no quotes_latest row at
+        # all -- distinct from EXPIRED (a quote existed and aged out).
+        # Falls back to the EOD price for display exactly like EXPIRED
+        # does, but must be flagged loudly and differently: something
+        # upstream (universe scope, yfinance, or the poller itself)
+        # never even attempted or resolved this symbol this cycle.
+        intraday_missing = bool(market_open and not intraday)
         if market_open and intraday:
             i_status, i_age_min = classify_intraday_freshness(intraday["quote_ts"])
             if i_status != "EXPIRED":
@@ -650,6 +680,12 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             price_as_of_display = str(price_info["trade_date"]) if price_info else None
             source_display = PRICE_SOURCE_LABEL if price_info else None
             age_minutes = None
+            if intraday_missing:
+                # Real EOD price still shown (never blank a row just
+                # because intraday failed) -- but freshness_status is
+                # overridden to MISSING so the row chip visibly differs
+                # from a normal, expected EOD_ONLY state.
+                freshness_status = "MISSING"
 
         value = (qty * last_price) if (qty and last_price is not None) else None
         pnl_inr_row = ((last_price - entry) * qty) if (qty and entry and last_price is not None) else None
@@ -660,7 +696,7 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             "qty": qty, "entry": entry, "last": last_price, "signal": signal_price,
             "price_as_of": price_as_of_display, "source": source_display,
             "age_days": age_days, "age_minutes": age_minutes, "freshness": freshness_status,
-            "is_intraday": is_intraday,
+            "is_intraday": is_intraday, "intraday_missing": intraday_missing,
             "value": value, "pnl_inr": pnl_inr_row, "pnl_pct": pnl_pct_row,
             "weight": r.get("weight"), "paper_action": paper_action,
         })
@@ -680,34 +716,49 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     # intraday plane must still read as EOD_ONLY-class, never claim LIVE.
     n_intraday_rows = sum(1 for row in rows if row["is_intraday"])
     n_intraday_expired = sum(1 for row in rows if row["freshness"] == "EXPIRED")
+    n_intraday_missing = sum(1 for row in rows if row["intraday_missing"])
     intraday_really_active = n_intraday_rows > 0
-    disclosure = ("Yahoo Finance delayed intraday quotes active (display/indicative only)"
-                  if intraday_really_active else "EOD close only — intraday LTP not yet active")
+    latest_intraday_ts = max((row["price_as_of"] for row in rows if row["is_intraday"]), default=None)
 
+    # R16 (operator ruling 2026-08-10, "banner copy bug"): the old
+    # 2-way active/not-active split let a genuinely DEGRADED state
+    # (market open, no fresh quotes -- a real problem) read identically
+    # to a normal after-hours EOD_ONLY state ("intraday LTP not yet
+    # active" for both), and both used to imply "this system has no
+    # intraday feed" even after Step 6P shipped one. Three real,
+    # distinct states now, each with its own wording and CSS class:
     if oldest is None and not intraday_really_active:
         ctx["freshness_banner_status"] = "STALE"
-        ctx["freshness_banner_text"] = ("PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
-                                          f"{disclosure} · {market_phrase}.")
+        ctx["freshness_banner_text"] = (
+            "PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
+            f"EOD close only — intraday quote plane not active · {market_phrase}.")
     elif intraday_really_active:
         worst_status = "EXPIRED" if n_intraday_expired else ("STALE" if ctx["n_stale"] else "FRESH")
         ctx["freshness_banner_status"] = "STALE" if worst_status == "EXPIRED" else worst_status
+        latest_hm = latest_intraday_ts.split(" ")[-2] + " IST" if latest_intraday_ts else "n/a"
         ctx["freshness_banner_text"] = (
-            f"{disclosure} · {n_intraday_rows}/{ctx['n_symbols']} symbols live "
-            f"({n_intraday_expired} expired, suppressed) · {market_phrase} · Source: {INTRADAY_SOURCE_LABEL} "
+            f"Intraday quotes active — {INTRADAY_SOURCE_LABEL} · latest quote {latest_hm} "
+            f"· fresh symbols {n_intraday_rows}/{ctx['n_symbols']} "
+            f"({n_intraday_expired} expired, suppressed"
+            + (f", {n_intraday_missing} MISSING — no quote received" if n_intraday_missing else "")
+            + f") · {market_phrase} "
             f"· EOD reference: {ctx['latest_bhavcopy_date']} (signal/rank/ledger basis, unchanged)"
+        )
+    elif is_open:
+        # Market genuinely open right now but not one target-book symbol
+        # resolved to a fresh intraday quote -- a real degraded state,
+        # never to be shown identically to normal after-hours EOD_ONLY.
+        ctx["freshness_banner_status"] = "DEGRADED"
+        ctx["freshness_banner_text"] = (
+            f"Intraday quote plane degraded — 0/{ctx['n_symbols']} fresh · check quote feed "
+            f"· {market_phrase} · EOD reference: {ctx['latest_bhavcopy_date']}"
         )
     else:
         worst_status = "STALE" if ctx["n_stale"] else ("DELAYED" if oldest > PRICE_FRESH_MAX_DAYS else "FRESH")
-        # amber EOD_ONLY treatment overrides the day-count-based color
-        # whenever the market is genuinely open right now -- that is
-        # precisely the scenario the ruling flagged (Friday's close
-        # reading as "FRESH" during Monday market hours is technically
-        # correct by the day-count threshold but misleading to an
-        # operator watching a live market).
-        banner_status = "EOD_ONLY" if is_open else worst_status
-        ctx["freshness_banner_status"] = banner_status
+        ctx["freshness_banner_status"] = "EOD_ONLY"
         ctx["freshness_banner_text"] = (
-            f"EOD close {newest_date} · {market_phrase} · {disclosure} · {next_update_phrase} "
+            f"Market closed — EOD reference shown ({newest_date}); last intraday quotes expired/suppressed "
+            f"· next session quotes resume at {NSE_OPEN.strftime('%H:%M')} IST · {next_update_phrase} "
             f"· Source: {PRICE_SOURCE_LABEL} · Age: {oldest} calendar day(s) ({worst_status} by day-count)"
         )
 
@@ -902,12 +953,14 @@ details.panel summary .sumline .w2{color:var(--amber)}
 .freshbar.DELAYED{border-left:3px solid var(--amber);color:var(--dim)}
 .freshbar.STALE{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
 .freshbar.EOD_ONLY{border-left:3px solid var(--amber);background:rgba(245,158,11,.06);color:var(--text)}
+.freshbar.DEGRADED{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
 tbody td.pxcell{white-space:nowrap}
 .fchip{display:inline-block;font-size:7.5px;font-weight:700;padding:1px 4px;border-radius:2px;margin-left:5px;letter-spacing:.3px;vertical-align:middle}
 .fchip.FRESH{background:rgba(34,197,94,.14);color:var(--green)}
 .fchip.DELAYED{background:rgba(245,158,11,.14);color:var(--amber)}
 .fchip.STALE{background:rgba(239,68,68,.14);color:var(--red)}
 .fchip.EXPIRED{background:rgba(239,68,68,.22);color:var(--red);text-decoration:line-through}
+.fchip.MISSING{background:rgba(239,68,68,.28);color:#fff;font-weight:800}
 @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.grid2,.grid3,.dd-body,.issue-grid,.hero-grid{grid-template-columns:1fr}.pipewrap{grid-template-columns:repeat(2,1fr)}.exc{border-left:none;border-top:1px solid var(--border)}.dec-grid{grid-template-columns:repeat(2,auto)}}
 """
 
@@ -949,7 +1002,18 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         # as if current, even though a real quote_ts exists (row["last"]
         # is None for that case, set upstream in build_dashboard_context).
         last_display = f"{row['last']:.2f}" if row["last"] is not None else "—"
-        if row["is_intraday"] or row["freshness"] == "EXPIRED" and row["price_as_of"]:
+        if row["intraday_missing"] and row["price_as_of"]:
+            # WELCORP-bug follow-up (operator ruling 2026-08-10): market
+            # open, this target-book symbol has NO quotes_latest row at
+            # all -- distinct from EXPIRED (a quote existed and aged
+            # out). EOD price still shown, but the chip must say MISSING
+            # loudly, not silently blend into a normal EOD_ONLY date.
+            short_date = row["price_as_of"][8:10] + "-" + \
+                {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May", "06": "Jun",
+                 "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}[row["price_as_of"][5:7]]
+            tooltip = "NSE market open but no intraday quote received for this symbol -- showing EOD close instead"
+            as_of = f" <span class='fchip MISSING' title='{tooltip}'>MISSING · {short_date}</span>"
+        elif row["is_intraday"] or row["freshness"] == "EXPIRED" and row["price_as_of"]:
             age_txt = f"{row['age_minutes']:.0f} min old" if row.get("age_minutes") is not None else ""
             tooltip = f"{_esc(row['source'])} · {_esc(row['price_as_of'])} · {age_txt}"
             short_label = row["price_as_of"][11:16] if len(row["price_as_of"]) > 15 else row["price_as_of"]
@@ -1198,6 +1262,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
         f'<span>build: {_esc(ctx["build_tag"])} · fingerprint {_esc(ctx["build_fingerprint"])} · '
         f'built {_esc(ctx["build_timestamp"])}</span>'
         f'<span>app path: {_esc(ctx["build_app_path"])}</span>'
+        f'<span>public URL: {_esc(PUBLIC_DASHBOARD_URL)}</span>'
         f'<span>6P enabled: True · quote source: {_esc(INTRADAY_SOURCE_LABEL)}</span>'
         f'<span>quotes_latest: {_esc(qh_display)}</span>'
     )
