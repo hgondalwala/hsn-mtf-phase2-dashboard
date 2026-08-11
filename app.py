@@ -272,7 +272,7 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 # app is serving stale code, this hash will not match the hash of the
 # file actually pushed -- a real, checkable signal, not a hardcoded claim.
 _BUILD_TAG = "step6p-v1"
-_BUILD_TIMESTAMP_IST = "2026-08-10 17:30 IST"
+_BUILD_TIMESTAMP_IST = "2026-08-11 12:11 IST"
 
 # R13 (operator ruling 2026-08-10): the public URL was previously not
 # recorded anywhere, causing a real verification gap mid-investigation
@@ -292,20 +292,58 @@ def _self_source_fingerprint() -> str:
         return "unavailable"
 
 
+# Operator ruling 2026-08-11: "operator must be able to see the
+# difference between Yahoo delayed/stale source and our poller not
+# running" -- dashboard footer must never let stale DB data look live.
+POLLER_CADENCE_MINUTES = 5  # GitHub Actions phase2_intraday_quotes.yml schedule
+POLLER_TOLERANCE_MINUTES = 10  # matches run_watchdog_production.QUOTE_POLL_TOLERANCE_MINUTES
+
+
 def load_quotes_latest_health(db_url: str) -> dict:
     """Real, cheap, always-on (not market-hours-gated) reachability
-    check for quotes_latest -- independent of load_intraday_quotes()
-    (which only runs during market hours for the actual row data).
-    Used only for the build-identity footer disclosure."""
+    check for quotes_latest/quotes_intraday/job_health -- independent of
+    load_intraday_quotes() (which only runs during market hours for the
+    actual row data). Used only for the build-identity footer
+    disclosure, which must be able to distinguish "poller not running"
+    (fetch_ts stale) from "Yahoo hasn't published a newer bar"
+    (quote_ts stale despite a recent fetch_ts) -- never blur the two
+    into a single vague timestamp."""
     try:
         conn = get_connection(db_url)
         with conn.cursor() as cur:
             cur.execute("SELECT count(*), max(quote_ts) FROM quotes_latest")
-            count, latest_ts = cur.fetchone()
-        return {"reachable": True, "count": count, "latest_quote_ts": str(latest_ts) if latest_ts else None,
-                "error": None}
+            count, latest_quote_ts = cur.fetchone()
+            cur.execute(
+                "SELECT last_run_at, notes FROM job_health WHERE job_name='phase2_quotes_intraday_poll' "
+                "ORDER BY last_run_at DESC LIMIT 1",
+            )
+            job_row = cur.fetchone()
+        now = datetime.now(timezone.utc)
+        last_poll_at = job_row[0] if job_row else None
+        poll_age_min = (now - last_poll_at).total_seconds() / 60.0 if last_poll_at else None
+        quote_age_min = (now - latest_quote_ts).total_seconds() / 60.0 if latest_quote_ts else None
+        if poll_age_min is None:
+            poller_status = "NEVER_RUN"
+        elif poll_age_min > POLLER_TOLERANCE_MINUTES:
+            poller_status = "POLLER_SILENT"
+        elif quote_age_min is not None and quote_age_min > POLLER_TOLERANCE_MINUTES:
+            poller_status = "SOURCE_STALE"
+        else:
+            poller_status = "OK"
+        next_expected = (last_poll_at + timedelta(minutes=POLLER_CADENCE_MINUTES)) if last_poll_at else None
+        return {
+            "reachable": True, "count": count, "latest_quote_ts": str(latest_quote_ts) if latest_quote_ts else None,
+            "quote_age_min": round(quote_age_min, 1) if quote_age_min is not None else None,
+            "last_poll_at": str(last_poll_at) if last_poll_at else None,
+            "poll_age_min": round(poll_age_min, 1) if poll_age_min is not None else None,
+            "next_expected_poll": str(next_expected) if next_expected else None,
+            "last_poll_notes": (job_row[1] or "")[:200] if job_row else None,
+            "poller_status": poller_status, "error": None,
+        }
     except Exception as exc:
-        return {"reachable": False, "count": None, "latest_quote_ts": None, "error": str(exc)[:200]}
+        return {"reachable": False, "count": None, "latest_quote_ts": None, "quote_age_min": None,
+                "last_poll_at": None, "poll_age_min": None, "next_expected_poll": None,
+                "last_poll_notes": None, "poller_status": "UNKNOWN", "error": str(exc)[:200]}
 
 
 def classify_price_freshness(trade_date, today=None) -> tuple:
@@ -1256,8 +1294,19 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
 </details>"""
 
     qh = ctx["quotes_health"]
-    qh_display = (f"reachable=True · count={qh['count']} · latest_quote_ts={qh['latest_quote_ts']}"
-                  if qh["reachable"] else f"reachable=False · error={qh['error']}")
+    if qh["reachable"]:
+        # Operator ruling 2026-08-11: quote_ts and fetch_ts (poll) shown
+        # as two SEPARATE ages -- collapsing them into one timestamp is
+        # exactly what let a 74-minute-stale poller look like "just a
+        # delayed quote." poller_status names which one is the problem.
+        qh_display = (
+            f"reachable=True · count={qh['count']} · poller={qh['poller_status']} · "
+            f"latest_quote_ts={qh['latest_quote_ts']} (age {qh['quote_age_min']}min) · "
+            f"last_poll={qh['last_poll_at']} (age {qh['poll_age_min']}min) · "
+            f"next_expected_poll={qh['next_expected_poll']}"
+        )
+    else:
+        qh_display = f"reachable=False · error={qh['error']}"
     build_html = (
         f'<span>build: {_esc(ctx["build_tag"])} · fingerprint {_esc(ctx["build_fingerprint"])} · '
         f'built {_esc(ctx["build_timestamp"])}</span>'
