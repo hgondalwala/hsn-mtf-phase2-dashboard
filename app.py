@@ -135,7 +135,8 @@ SNAPSHOT_COLS = ["id", "as_of_date", "latest_bhavcopy_date", "scanner_status", "
                   "paper_actions", "paper_pnl", "health_status", "health_gates", "unresolved_issue_overlap",
                   "materiality_flags", "quarantine_warnings", "ca_watch_status", "asm_gsm_status", "seam_status",
                   "continuity_status", "archive_status", "supabase_status", "b2_status", "failed_gate",
-                  "exact_failure_reason", "capital_status", "exact_next_action", "recommendation", "created_at"]
+                  "exact_failure_reason", "capital_status", "exact_next_action", "recommendation", "created_at",
+                  "daily_scanner_preview"]
 
 
 def load_latest_snapshot(db_url: str):
@@ -274,6 +275,21 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 _BUILD_TAG = "step6p-v1"
 _BUILD_TIMESTAMP_IST = "2026-08-11 12:11 IST"
 
+# R20 (operator ruling 2026-08-11, third recurrence of two-repo drift):
+# the footer must show the dashboard-repo build identity (already
+# covered by _self_source_fingerprint(), a hash of THIS file's own
+# bytes) and the main hsn-mtf-system repo's data/snapshot identity
+# (already covered by snapshot_identity_line()) as two DISTINCT,
+# separately-labeled lines -- never conflated. This third line closes
+# the actual gap: the exact main-repo git commit SHA that produced the
+# code currently deployed to this file, since this repo has no .git of
+# its own (see the module docstring) and _self_source_fingerprint()
+# proves file integrity but not which main-repo commit it came from.
+# Manually updated to the real `git rev-parse HEAD` of the main repo
+# immediately before each sync to this deploy repo -- same "hardcoded,
+# deliberately updated per deploy" pattern as _BUILD_TIMESTAMP_IST above.
+_MAIN_REPO_SOURCE_COMMIT = "4b94b9ab00861e1ce7c8adf5419a72d4550bd005"
+
 # R13 (operator ruling 2026-08-10): the public URL was previously not
 # recorded anywhere, causing a real verification gap mid-investigation
 # -- this repo cannot import phase2/deployment_config.py (it ships
@@ -297,6 +313,33 @@ def _self_source_fingerprint() -> str:
 # running" -- dashboard footer must never let stale DB data look live.
 POLLER_CADENCE_MINUTES = 5  # GitHub Actions phase2_intraday_quotes.yml schedule
 POLLER_TOLERANCE_MINUTES = 10  # matches run_watchdog_production.QUOTE_POLL_TOLERANCE_MINUTES
+
+
+def load_active_book_pin(db_url: str) -> dict:
+    """R20 (operator ruling 2026-08-11): the active-book banner must show
+    the real pinned_signal_date and the real entry/fill date, not just
+    the rebalance-due date already carried on the snapshot row. Two
+    narrow, real, read-only queries -- active_target_book_latest
+    (pinned_signal_date/rebalance_due_date) and paper_ledger_entry_date
+    (a single MIN(trade_date) view, never a direct grant on paper_trades
+    itself). Degrades to None fields on any failure -- the banner must
+    never fabricate a date it couldn't really read."""
+    try:
+        conn = get_connection(db_url)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pinned_signal_date, rebalance_due_date FROM active_target_book_latest")
+            row = cur.fetchone()
+            pinned_signal_date, rebalance_due_date = row if row else (None, None)
+            cur.execute("SELECT entry_date FROM paper_ledger_entry_date")
+            entry_row = cur.fetchone()
+            entry_date = entry_row[0] if entry_row else None
+        return {
+            "pinned_signal_date": str(pinned_signal_date) if pinned_signal_date else None,
+            "rebalance_due_date": str(rebalance_due_date) if rebalance_due_date else None,
+            "entry_date": str(entry_date) if entry_date else None,
+        }
+    except Exception:
+        return {"pinned_signal_date": None, "rebalance_due_date": None, "entry_date": None}
 
 
 def load_quotes_latest_health(db_url: str) -> dict:
@@ -546,12 +589,14 @@ def _esc(s) -> str:
 def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict,
                              previous_prices: dict, run148_ref: dict,
                              intraday_quotes: dict | None = None, market_open: bool = False,
-                             quotes_health: dict | None = None) -> dict:
+                             quotes_health: dict | None = None,
+                             active_book_pin: dict | None = None) -> dict:
     intraday_quotes = intraday_quotes or {}
     ctx = {}
     ctx["market_open"] = market_open
     ctx["intraday_active"] = bool(intraday_quotes)
     ctx["quotes_health"] = quotes_health or {"reachable": False, "count": None, "latest_quote_ts": None, "error": None}
+    ctx["active_book_pin"] = active_book_pin or {"pinned_signal_date": None, "rebalance_due_date": None, "entry_date": None}
     ctx["build_tag"] = _BUILD_TAG
     ctx["build_timestamp"] = _BUILD_TIMESTAMP_IST
     ctx["build_fingerprint"] = _self_source_fingerprint()
@@ -588,6 +633,17 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     recommendation = str(snap.get("recommendation") or "")
     m = re.search(r"next rebalance (\S+)", recommendation)
     ctx["next_rebalance"] = m.group(1) if m else "n/a"
+
+    # R20 (operator ruling 2026-08-11): the active book must read as
+    # pinned/frozen, and any fresher scanner recompute must be visibly
+    # separate and non-actionable -- never silently blended into "the
+    # book" above. daily_scanner_preview is the real, unactioned output
+    # of that same day's scanner pass (see run_eod_pipeline_production.py).
+    tb_symbols_early = {r.get("symbol") for r in (_jsonb(snap["target_book"]) or [])}
+    scanner_preview = _jsonb(snap.get("daily_scanner_preview")) or []
+    preview_symbols = {r.get("symbol") for r in scanner_preview}
+    ctx["daily_scanner_preview"] = scanner_preview
+    ctx["scanner_preview_differs"] = bool(scanner_preview) and preview_symbols != tb_symbols_early
 
     ctx["capital_status"] = snap["capital_status"]
     ctx["capital_action_display"] = ("NOT ALLOWED — shadow only" if snap["capital_status"] == "SHADOW_ONLY_NO_CAPITAL"
@@ -1175,6 +1231,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
 
     freshbar_html = f"""<div class="freshbar {ctx['freshness_banner_status']}">{_esc(ctx['freshness_banner_text'])}</div>"""
     snapshot_stale_html = _snapshot_freshness_banner_html(ctx)
+    active_book_pin_html = _active_book_pin_banner_html(ctx)
 
     export_bar_html = f"""
 <div class="export-bar">
@@ -1275,6 +1332,18 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
         f'insufficient real data for this panel — no fabricated placeholder shown</div></div>'
     )
     run148 = ctx["run148"]
+    scanner_preview_dd = ""
+    if ctx.get("daily_scanner_preview"):
+        preview_rows = "".join(
+            f'<span class="exp-item">{_esc(p.get("symbol"))} (rank {_esc(p.get("rank"))})</span>'
+            for p in sorted(ctx["daily_scanner_preview"], key=lambda p: p.get("rank") or 999999)
+        )
+        scanner_preview_dd = f"""
+    <div class="dd-block" style="grid-column:1/-1"><h4>Daily Scanner Preview — NON-ACTIONABLE ({len(ctx['daily_scanner_preview'])} symbols, as_of {_esc(ctx['as_of_date'])})</h4><div class="inner">
+      <div class="chart-note">Same-day scanner recompute, kept for transparent audit only (R20). Never fed into paper actions or shown as the active book above. {'Differs from the pinned active book — see banner.' if ctx.get('scanner_preview_differs') else 'Matches the pinned active book.'}</div>
+      <div style="margin-top:6px">{preview_rows}</div>
+    </div></div>"""
+
     drilldown_html = f"""
 <details class="panel" id="ddPanel">
   <summary>Drill-Down — secondary charts, sealed records, provenance <span class="sumline">allocation · Tier-1 cert · quarantine · archive</span><span class="arrow">▶</span></summary>
@@ -1283,6 +1352,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     {dd_block_insufficient("Momentum Score Distribution (insufficient real universe-wide data)")}
     {dd_block_insufficient("Pipeline Run Timeline (no real per-stage timing captured)")}
     {dd_block_insufficient("Cycle Cost Waterfall (0 real fills — no real cost breakdown yet)")}
+    {scanner_preview_dd}
     <div class="dd-block" style="grid-column:1/-1"><h4>Tier-1 Rank Certification · Quarantine · Archive · Sealed Backtest Reference</h4><div class="inner">
       <div><span class="k">rank source: </span><span class="v">NSE XBRL shares × bhavcopy (reconstruction)</span></div>
       <div><span class="k">cert: </span><span class="v">PROVISIONAL · event-triggered expiry</span></div>
@@ -1308,8 +1378,12 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     else:
         qh_display = f"reachable=False · error={qh['error']}"
     build_html = (
-        f'<span>build: {_esc(ctx["build_tag"])} · fingerprint {_esc(ctx["build_fingerprint"])} · '
+        f'<span>dashboard repo build: {_esc(ctx["build_tag"])} · file fingerprint {_esc(ctx["build_fingerprint"])} · '
         f'built {_esc(ctx["build_timestamp"])}</span>'
+        # R20: explicit, separately-labeled main-repo commit identity --
+        # never conflated with the dashboard repo's own file fingerprint
+        # above or the data/snapshot identity line below.
+        f'<span>main repo source commit: {_esc(_MAIN_REPO_SOURCE_COMMIT[:12])}</span>'
         f'<span>app path: {_esc(ctx["build_app_path"])}</span>'
         f'<span>public URL: {_esc(PUBLIC_DASHBOARD_URL)}</span>'
         f'<span>6P enabled: True · quote source: {_esc(INTRADAY_SOURCE_LABEL)}</span>'
@@ -1465,6 +1539,7 @@ tick(); setInterval(tick,1000);
   <div class="clock" id="clock"></div>
 </div>
 <div class="hero {hero_cls}" id="hero">{hero_inner}</div>
+{active_book_pin_html}
 {snapshot_stale_html}
 {kpis_html}
 {freshbar_html}
@@ -1529,6 +1604,38 @@ _LOADING_SHELL_HTML = f"""<!DOCTYPE html><html><head><style>{DASH3_CSS}</style><
 <div class="usable-big u-amber">LOADING REAL SNAPSHOT…</div>
 <div class="hero-note" style="margin-top:14px">Querying operating_state_latest (read-only) — this is not a fault, the page updates automatically once the query returns.</div>
 </div></div></body></html>"""
+
+
+def _active_book_pin_banner_html(ctx: dict) -> str:
+    """R20 (operator ruling 2026-08-11, "cannot wait", exact wording
+    required in the follow-up ruling): "ACTIVE BOOK — frozen until
+    2026-09-01 / Signal date: 2026-08-07 · Entry date: 2026-08-10 /
+    Daily scanner preview is non-actionable." Minimal, reuses the
+    existing .freshbar component/CSS -- no new panel, no redesign
+    (operator directive: "avoid adding more clutter to the main
+    dashboard" during this close-out). pinned_signal_date/entry_date are
+    real values from load_active_book_pin() (active_target_book_latest /
+    paper_ledger_entry_date) -- 'not yet available' if that real query
+    ever fails, never a fabricated date. If the same-day scanner
+    recompute (daily_scanner_preview) differs from the pinned book, that
+    is flagged in a second line and pointed at Drill-Down -- never
+    rendered as if it were the book."""
+    pin = ctx.get("active_book_pin") or {}
+    rebalance_due = pin.get("rebalance_due_date") or ctx.get("next_rebalance", "n/a")
+    signal_date = pin.get("pinned_signal_date") or "not yet available"
+    entry_date = pin.get("entry_date") or "not yet available"
+    preview_line = (
+        f'<div class="freshbar FRESH">Daily scanner preview is non-actionable — a newer scanner recompute exists '
+        f'({len(ctx["daily_scanner_preview"])} symbols, different membership), never fed into paper actions. '
+        f'See Drill-Down → Daily Scanner Preview.</div>'
+        if ctx.get("scanner_preview_differs") else
+        '<div class="freshbar FRESH">Daily scanner preview is non-actionable.</div>'
+    )
+    return (
+        f'<div class="freshbar FRESH">🔒 ACTIVE BOOK — frozen until {_esc(rebalance_due)}<br>'
+        f'Signal date: {_esc(signal_date)} · Entry date: {_esc(entry_date)}</div>'
+        f'{preview_line}'
+    )
 
 
 def _snapshot_freshness_banner_html(ctx: dict) -> str:
@@ -1615,11 +1722,13 @@ def main():
     # snapshot render, only the footer's own quotes_latest line.
     quotes_health = load_quotes_latest_health(db_url) if not is_stale_fallback else \
         {"reachable": False, "count": None, "latest_quote_ts": None, "error": "stale fallback render"}
+    active_book_pin = load_active_book_pin(db_url) if not is_stale_fallback else \
+        {"pinned_signal_date": None, "rebalance_due_date": None, "entry_date": None}
 
     run148_ref = load_run148_reference()
     ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref,
                                     intraday_quotes=intraday_quotes, market_open=market_open,
-                                    quotes_health=quotes_health)
+                                    quotes_health=quotes_health, active_book_pin=active_book_pin)
     html = render_dash3_html(ctx, dev_mode=False)
     if is_stale_fallback:
         html = html.replace('<div class="cmdstrip">',
