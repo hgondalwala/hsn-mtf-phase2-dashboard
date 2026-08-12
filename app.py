@@ -339,6 +339,7 @@ def load_active_book_pin(db_url: str) -> dict:
             "entry_date": str(entry_date) if entry_date else None,
         }
     except Exception:
+        get_connection.clear()
         return {"pinned_signal_date": None, "rebalance_due_date": None, "entry_date": None}
 
 
@@ -384,6 +385,11 @@ def load_quotes_latest_health(db_url: str) -> dict:
             "poller_status": poller_status, "error": None,
         }
     except Exception as exc:
+        # Same real connection-drop class documented in load_latest_snapshot()
+        # (2026-08-10) -- without clearing the cache here, a dead cached
+        # connection stays dead for every subsequent rerun of this app
+        # process, not just this one failed attempt.
+        get_connection.clear()
         return {"reachable": False, "count": None, "latest_quote_ts": None, "quote_age_min": None,
                 "last_poll_at": None, "poll_age_min": None, "next_expected_poll": None,
                 "last_poll_notes": None, "poller_status": "UNKNOWN", "error": str(exc)[:200]}
@@ -590,9 +596,18 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
                              previous_prices: dict, run148_ref: dict,
                              intraday_quotes: dict | None = None, market_open: bool = False,
                              quotes_health: dict | None = None,
-                             active_book_pin: dict | None = None) -> dict:
+                             active_book_pin: dict | None = None,
+                             price_load_error: str | None = None) -> dict:
     intraday_quotes = intraday_quotes or {}
     ctx = {}
+    # 2026-08-12 fix: a real live price-query exception (e.g. a dead
+    # cached connection) must never render identically to "no bhavcopy
+    # row exists yet" -- the former is a system fault (summary cards
+    # already have real data from paper_pnl; only this live re-query
+    # failed), the latter is a legitimate data gap. price_load_error
+    # being set drives a distinct PRICE_JOIN_FAILURE banner + per-row
+    # REVIEW_REQUIRED marker below instead of the generic STALE text.
+    ctx["price_load_error"] = price_load_error
     ctx["market_open"] = market_open
     ctx["intraday_active"] = bool(intraday_quotes)
     ctx["quotes_health"] = quotes_health or {"reachable": False, "count": None, "latest_quote_ts": None, "error": None}
@@ -821,7 +836,20 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     # active" for both), and both used to imply "this system has no
     # intraday feed" even after Step 6P shipped one. Three real,
     # distinct states now, each with its own wording and CSS class:
-    if oldest is None and not intraday_really_active:
+    if price_load_error:
+        # Real query exception this render, not a legitimate data gap --
+        # required consistency rule: never show a valid-looking summary
+        # with silently blank rows. self-heals next rerun (get_connection
+        # cleared in main()'s except block), but THIS render must disclose
+        # the fault honestly rather than reuse the ambiguous STALE text.
+        ctx["freshness_banner_status"] = "PRICE_JOIN_FAILURE"
+        ctx["freshness_banner_text"] = (
+            "PRICE_JOIN_FAILURE — REVIEW_REQUIRED: a live price query failed this render "
+            f"(real bhavcopy for {ctx['latest_bhavcopy_date']} exists — see summary P&L, computed "
+            "server-side at publish time). Row-level Last/Value/P&L are suppressed, not fabricated. "
+            "Refresh in a moment; self-heals on the next successful query."
+        )
+    elif oldest is None and not intraday_really_active:
         ctx["freshness_banner_status"] = "STALE"
         ctx["freshness_banner_text"] = (
             "PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
@@ -1048,6 +1076,7 @@ details.panel summary .sumline .w2{color:var(--amber)}
 .freshbar.STALE{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
 .freshbar.EOD_ONLY{border-left:3px solid var(--amber);background:rgba(245,158,11,.06);color:var(--text)}
 .freshbar.DEGRADED{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
+.freshbar.PRICE_JOIN_FAILURE{border-left:3px solid var(--red);background:rgba(239,68,68,.14);color:var(--text);font-weight:700}
 tbody td.pxcell{white-space:nowrap}
 .fchip{display:inline-block;font-size:7.5px;font-weight:700;padding:1px 4px;border-radius:2px;margin-left:5px;letter-spacing:.3px;vertical-align:middle}
 .fchip.FRESH{background:rgba(34,197,94,.14);color:var(--green)}
@@ -1086,7 +1115,7 @@ def _pipe_chip_html(name: str, status: str) -> str:
             f"<div class='ps'>{human}</div></div>")
 
 
-def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
+def _holdings_table_rows_html(rows: list, has_real_fills: bool, price_load_error: str | None = None) -> str:
     out = []
     for row in rows:
         ovl = "overlap" if row["flag"] else ""
@@ -1095,7 +1124,8 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         # Step 6P: EXPIRED intraday quotes are suppressed -- never shown
         # as if current, even though a real quote_ts exists (row["last"]
         # is None for that case, set upstream in build_dashboard_context).
-        last_display = f"{row['last']:.2f}" if row["last"] is not None else "—"
+        last_display = (f"{row['last']:.2f}" if row["last"] is not None else
+                          ("<span class='fchip MISSING'>REVIEW_REQUIRED</span>" if price_load_error else "—"))
         if row["intraday_missing"] and row["price_as_of"]:
             # WELCORP-bug follow-up (operator ruling 2026-08-10): market
             # open, this target-book symbol has NO quotes_latest row at
@@ -1124,9 +1154,10 @@ def _holdings_table_rows_html(rows: list, has_real_fills: bool) -> str:
         signal_display = f"{row['signal']:.2f}" if row["signal"] is not None else "—"
         if has_real_fills and row["qty"]:
             qty_d, entry_d = f"{row['qty']:.0f}", f"{row['entry']:.2f}"
-            value_d = f"{row['value']:.0f}" if row["value"] is not None else "—"
-            pnl_d = f"{row['pnl_inr']:+.0f}" if row["pnl_inr"] is not None else "—"
-            pnl_pct_d = f"{row['pnl_pct']:+.2f}%" if row["pnl_pct"] is not None else "—"
+            no_price_d = "<span class='fchip MISSING'>REVIEW_REQUIRED</span>" if price_load_error else "—"
+            value_d = f"{row['value']:.0f}" if row["value"] is not None else no_price_d
+            pnl_d = f"{row['pnl_inr']:+.0f}" if row["pnl_inr"] is not None else no_price_d
+            pnl_pct_d = f"{row['pnl_pct']:+.2f}%" if row["pnl_pct"] is not None else no_price_d
             pnl_cls = "up" if (row["pnl_inr"] or 0) >= 0 else "dn"
         else:
             qty_d = entry_d = value_d = pnl_d = pnl_pct_d = "—"
@@ -1277,7 +1308,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     <div class="meta">{ctx['n_symbols']} of {ctx['n_symbols']} shown in one frame · Last Rs source: {PRICE_SOURCE_LABEL}</div></div>
   <table>
     <thead><tr><th>Symbol</th><th>Rank</th><th>z</th><th>Qty</th><th>Entry ₹</th><th>Signal ₹</th><th>Last ₹ · as of</th><th>Value ₹</th><th>P&amp;L ₹</th><th>P&amp;L %</th><th>Wt</th><th>Paper Action</th></tr></thead>
-    <tbody>{_holdings_table_rows_html(ctx['holdings_rows'], has_real_fills)}</tbody>
+    <tbody>{_holdings_table_rows_html(ctx['holdings_rows'], has_real_fills, ctx.get('price_load_error'))}</tbody>
   </table>
   {fills_note}
 </div>"""
@@ -1703,6 +1734,7 @@ def main():
     tb_symbols = [r.get("symbol") for r in (_jsonb(snap["target_book"]) or [])]
     price_t0 = time.monotonic()
     market_open, _now_ist = _nse_market_open()
+    price_load_error = None
     try:
         latest_prices = load_latest_prices(db_url, tb_symbols) if not is_stale_fallback else {}
         signal_prices = load_signal_date_prices(db_url, tb_symbols, snap["as_of_date"]) if not is_stale_fallback else {}
@@ -1712,8 +1744,19 @@ def main():
         # never "really active" regardless (build_dashboard_context falls
         # back to EOD-only), so skip the extra real DB round-trip.
         intraday_quotes = load_intraday_quotes(db_url, tb_symbols) if (not is_stale_fallback and market_open) else {}
-    except Exception:
+    except Exception as exc:
+        # Real bug found 2026-08-12: this block shares ONE cached
+        # connection (get_connection(db_url)) with load_latest_snapshot(),
+        # which already self-heals on failure -- but this block never did,
+        # so a connection that died between the snapshot read and here
+        # stayed dead for every subsequent rerun of the whole app process,
+        # silently blanking every holdings row indefinitely while the
+        # summary cards (built from snap["paper_pnl"], not this query)
+        # kept looking correct. Clearing the cache lets the NEXT rerun
+        # open a fresh connection instead of retrying a known-dead one.
+        get_connection.clear()
         latest_prices, signal_prices, previous_prices, intraday_quotes = {}, {}, {}, {}
+        price_load_error = str(exc)[:200]
     price_load_seconds = time.monotonic() - price_t0
 
     # Build-identity footer diagnostic (operator ruling 2026-08-10, item
@@ -1728,7 +1771,8 @@ def main():
     run148_ref = load_run148_reference()
     ctx = build_dashboard_context(snap, latest_prices, signal_prices, previous_prices, run148_ref,
                                     intraday_quotes=intraday_quotes, market_open=market_open,
-                                    quotes_health=quotes_health, active_book_pin=active_book_pin)
+                                    quotes_health=quotes_health, active_book_pin=active_book_pin,
+                                    price_load_error=price_load_error)
     html = render_dash3_html(ctx, dev_mode=False)
     if is_stale_fallback:
         html = html.replace('<div class="cmdstrip">',
