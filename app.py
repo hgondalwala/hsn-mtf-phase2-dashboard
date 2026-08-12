@@ -572,6 +572,9 @@ def _freshness_phrase(status: str, trade_date, age_days) -> str:
         return f"EOD close {trade_date} · fresh until next NSE session"
     if status == "DELAYED":
         return f"EOD close {trade_date} · {age_days} calendar days old · delayed, next session pending"
+    if status == "POLLER_STALE":
+        return (f"EOD close {trade_date} shown — intraday poller has not run recently this cycle, "
+                 "its own quote is not trusted as live regardless of age")
     return f"EOD close {trade_date} · {age_days} calendar days old · STALE"
 
 
@@ -760,6 +763,17 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     positions_by_symbol = {p.get("symbol"): p for p in (_jsonb(snap["paper_positions"]) or [])}
     actions_by_symbol = {a.get("symbol"): a for a in (_jsonb(snap["paper_actions"]) or [])}
     overlap_by_symbol = {o.get("symbol"): o.get("reason") for o in overlap}
+    # 2026-08-12 operator ruling: a fresh-looking quote_ts alone does not
+    # mean the intraday plane is trustworthy -- the poller itself can go
+    # silent (GitHub Actions cron gap) while an old quotes_latest row
+    # sits there looking recent-ish. quotes_health["poller_status"]
+    # (already computed by load_quotes_latest_health, independent of
+    # per-row quote_ts) is the real signal for "did the poller actually
+    # run recently" -- POLLER_SILENT/NEVER_RUN means nothing intraday
+    # this render can be trusted as live, regardless of any individual
+    # row's own quote_ts age.
+    poller_status = ctx["quotes_health"].get("poller_status")
+    poller_reliable = poller_status not in ("POLLER_SILENT", "NEVER_RUN")
     rows = []
     for r in ctx["tb"]:
         symbol = r.get("symbol")
@@ -788,7 +802,13 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         # upstream (universe scope, yfinance, or the poller itself)
         # never even attempted or resolved this symbol this cycle.
         intraday_missing = bool(market_open and not intraday)
-        if market_open and intraday:
+        # 2026-08-12 operator ruling: a poller-silent render must never
+        # present LTP as fresh, even if this row's own quote_ts hasn't
+        # individually crossed the EXPIRED threshold yet -- distinct from
+        # EXPIRED (a real, individually-aged-out quote) and from MISSING
+        # (this symbol never got a row at all).
+        poller_stale_override = bool(market_open and intraday and not poller_reliable)
+        if market_open and intraday and poller_reliable:
             i_status, i_age_min = classify_intraday_freshness(intraday["quote_ts"])
             if i_status != "EXPIRED":
                 is_intraday = True
@@ -817,6 +837,15 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
                 # overridden to MISSING so the row chip visibly differs
                 # from a normal, expected EOD_ONLY state.
                 freshness_status = "MISSING"
+            elif poller_stale_override:
+                # Real EOD price still shown (never blank a row) -- but
+                # this quote existed and was never even evaluated for its
+                # own age, because the poller itself is untrusted this
+                # render (operator ruling 2026-08-12). Distinct from
+                # EXPIRED (an individually-aged-out quote) so the operator
+                # can tell "our poller is silent" from "this one quote
+                # aged out" at a glance.
+                freshness_status = "POLLER_STALE"
 
         value = (qty * last_price) if (qty and last_price is not None) else None
         pnl_inr_row = ((last_price - entry) * qty) if (qty and entry and last_price is not None) else None
@@ -911,6 +940,24 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             "server-side at publish time). Row-level Last/Value/P&L are suppressed, not fabricated. "
             "Refresh in a moment; self-heals on the next successful query."
         )
+    elif market_open and poller_status in ("POLLER_SILENT", "NEVER_RUN"):
+        # Operator ruling 2026-08-12: a fresh-looking quote_ts row means
+        # nothing if the poller that would refresh it has itself gone
+        # silent (real evidence: 2026-08-12, GitHub Actions cron gap --
+        # 5-min */5 schedule skipped several cycles in a row). This must
+        # read as a distinct, named REVIEW_REQUIRED fault, never blend
+        # into a generic STALE/DEGRADED banner -- and must always
+        # disclose BOTH ages, never quote age alone.
+        qh = ctx["quotes_health"]
+        poll_age_disp = f"{qh['poll_age_min']:.1f}" if qh.get("poll_age_min") is not None else "n/a"
+        quote_age_disp = f"{qh['quote_age_min']:.1f}" if qh.get("quote_age_min") is not None else "n/a"
+        ctx["freshness_banner_status"] = "POLLER_STALE"
+        ctx["freshness_banner_text"] = (
+            f"POLLER_STALE / REVIEW_REQUIRED — intraday quote poller has not run recently "
+            f"(poll age {poll_age_disp} min · quote age {quote_age_disp} min · tolerance "
+            f"{POLLER_TOLERANCE_MINUTES} min). Rows fall back to EOD bhavcopy, never presented as live "
+            f"· {market_phrase} · EOD reference: {ctx['latest_bhavcopy_date']}"
+        )
     elif oldest is None and not intraday_really_active:
         ctx["freshness_banner_status"] = "STALE"
         ctx["freshness_banner_text"] = (
@@ -920,6 +967,16 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         worst_status = "EXPIRED" if n_intraday_expired else ("STALE" if ctx["n_stale"] else "FRESH")
         ctx["freshness_banner_status"] = "STALE" if worst_status == "EXPIRED" else worst_status
         latest_hm = latest_intraday_ts.split(" ")[-2] + " IST" if latest_intraday_ts else "n/a"
+        qh = ctx["quotes_health"]
+        poll_age_disp = f"{qh['poll_age_min']:.1f}" if qh.get("poll_age_min") is not None else "n/a"
+        quote_age_disp = f"{qh['quote_age_min']:.1f}" if qh.get("quote_age_min") is not None else "n/a"
+        # Rule 3 (operator ruling 2026-08-12): always disclose BOTH quote
+        # age and poll age here, never quote time alone. Rule 5: when the
+        # source itself (not our poller) is the delayed leg, say so
+        # explicitly in the same words the operator specified.
+        source_delay_note = (f" · Yahoo/yfinance delayed quote · quote age {quote_age_disp} min "
+                               f"· poll age {poll_age_disp} min" if poller_status == "SOURCE_STALE" else
+                               f" · quote age {quote_age_disp} min · poll age {poll_age_disp} min")
         ctx["freshness_banner_text"] = (
             f"Intraday quotes active — {INTRADAY_SOURCE_LABEL} · latest quote {latest_hm} "
             f"· fresh symbols {n_intraday_rows}/{ctx['n_symbols']} "
@@ -927,6 +984,7 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             + (f", {n_intraday_missing} MISSING — no quote received" if n_intraday_missing else "")
             + f") · {market_phrase} "
             f"· EOD reference: {ctx['latest_bhavcopy_date']} (signal/rank/ledger basis, unchanged)"
+            + source_delay_note
         )
     elif is_open:
         # Market genuinely open right now but not one target-book symbol
@@ -1139,6 +1197,7 @@ details.panel summary .sumline .w2{color:var(--amber)}
 .freshbar.EOD_ONLY{border-left:3px solid var(--amber);background:rgba(245,158,11,.06);color:var(--text)}
 .freshbar.DEGRADED{border-left:3px solid var(--red);background:rgba(239,68,68,.08);color:var(--text);font-weight:700}
 .freshbar.PRICE_JOIN_FAILURE{border-left:3px solid var(--red);background:rgba(239,68,68,.14);color:var(--text);font-weight:700}
+.freshbar.POLLER_STALE{border-left:3px solid var(--red);background:rgba(239,68,68,.14);color:var(--text);font-weight:700}
 tbody td.pxcell{white-space:nowrap}
 .fchip{display:inline-block;font-size:7.5px;font-weight:700;padding:1px 4px;border-radius:2px;margin-left:5px;letter-spacing:.3px;vertical-align:middle}
 .fchip.FRESH{background:rgba(34,197,94,.14);color:var(--green)}
@@ -1146,6 +1205,7 @@ tbody td.pxcell{white-space:nowrap}
 .fchip.STALE{background:rgba(239,68,68,.14);color:var(--red)}
 .fchip.EXPIRED{background:rgba(239,68,68,.22);color:var(--red);text-decoration:line-through}
 .fchip.MISSING{background:rgba(239,68,68,.28);color:#fff;font-weight:800}
+.fchip.POLLER_STALE{background:rgba(239,68,68,.28);color:#fff;font-weight:800}
 @media(max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.grid2,.grid3,.dd-body,.issue-grid,.hero-grid{grid-template-columns:1fr}.pipewrap{grid-template-columns:repeat(2,1fr)}.exc{border-left:none;border-top:1px solid var(--border)}.dec-grid{grid-template-columns:repeat(2,auto)}}
 """
 
