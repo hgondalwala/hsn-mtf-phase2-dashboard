@@ -624,20 +624,42 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     ctx["status_code"] = f"health_status: {snap['health_status']}" + (
         f" · failed_gate: {snap['failed_gate']}" if snap.get("failed_gate") else "")
 
+    # 2026-08-12 operator ruling: the headline Portfolio Value / Paper P&L
+    # must be computed on the SAME price basis as the visible holdings
+    # rows below (live intraday when fresh, EOD bhavcopy otherwise) --
+    # never a server-computed EOD-only number sitting above rows that are
+    # showing live intraday marks. The EOD-basis paper_pnl below is kept
+    # only as a secondary reference value (eod_reference_*), never the
+    # primary display, once real rows exist to reconcile against.
     pnl = _jsonb(snap["paper_pnl"]) or {}
     ctx["pnl"] = pnl
-    ctx["portfolio_value_display"] = _indian_rupee(pnl.get("total_equity"))
     ctx["n_positions"] = pnl.get("n_positions", 0)
-    if pnl.get("n_positions") == 0:
+    eod_pnl_inr = pnl.get("cumulative_pnl_inr", 0) or 0
+    eod_pnl_pct = pnl.get("cumulative_pnl_pct", 0) or 0
+    ctx["eod_reference_value_display"] = _indian_rupee(pnl.get("total_equity"))
+    ctx["eod_reference_pnl_display"] = ("+" if eod_pnl_inr >= 0 else "") + _indian_rupee(eod_pnl_inr)
+    ctx["eod_reference_pnl_pct_display"] = f"{'+' if eod_pnl_pct >= 0 else ''}{eod_pnl_pct * 100:.2f}%"
+    if ctx["n_positions"] == 0:
+        # No real fills yet -- nothing to reconcile against, EOD/live
+        # basis distinction is moot.
+        ctx["portfolio_value_display"] = ctx["eod_reference_value_display"]
         ctx["pnl_display"] = "Ledger pending"
         ctx["pnl_sub"] = "no fills yet, 0 open positions"
         ctx["pnl_class"] = "flat"
+        ctx["pnl_basis"] = "NONE"
+        ctx["pnl_basis_label"] = ""
+        ctx["valuation_basis_mismatch"] = False
     else:
-        pnl_inr = pnl.get("cumulative_pnl_inr", 0) or 0
-        pnl_pct = pnl.get("cumulative_pnl_pct", 0) or 0
-        ctx["pnl_display"] = ("+" if pnl_inr >= 0 else "") + _indian_rupee(pnl_inr)
-        ctx["pnl_sub"] = f"{'+' if pnl_pct >= 0 else ''}{pnl_pct * 100:.2f}%"
-        ctx["pnl_class"] = "up" if pnl_inr >= 0 else "dn"
+        # Placeholder until the reconciled headline is computed below,
+        # once holdings_rows exist -- overwritten unconditionally further
+        # down for every n_positions>0 case (never left as this fallback).
+        ctx["portfolio_value_display"] = ctx["eod_reference_value_display"]
+        ctx["pnl_display"] = ctx["eod_reference_pnl_display"]
+        ctx["pnl_sub"] = ctx["eod_reference_pnl_pct_display"]
+        ctx["pnl_class"] = "up" if eod_pnl_inr >= 0 else "dn"
+        ctx["pnl_basis"] = "EOD"
+        ctx["pnl_basis_label"] = "EOD Paper P&L — NSE bhavcopy (server, last known — row-level pricing unavailable this render)"
+        ctx["valuation_basis_mismatch"] = False
 
     actions = _jsonb(snap["paper_actions"]) or []
     n_buy = sum(1 for a in actions if a.get("intended_action") == "PAPER_BUY")
@@ -811,6 +833,46 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         })
     ctx["holdings_rows"] = rows
     ctx["n_stale"] = sum(1 for row in rows if row["freshness"] == "STALE")
+
+    # 2026-08-12 operator ruling: reconcile the headline to the SAME rows
+    # rendered in the holdings table below -- single source of truth, not
+    # two independently-computed numbers. Only when real priced rows
+    # exist (n_positions>0, at least one row resolved a real price this
+    # render); otherwise the EOD-reference fallback set above stands.
+    if ctx["n_positions"] != 0 and not price_load_error:
+        priced = [r for r in ctx["holdings_rows"] if r["qty"] and r["last"] is not None]
+        unpriced = [r for r in ctx["holdings_rows"] if r["qty"] and r["last"] is None]
+        if priced:
+            total_value = sum(r["value"] for r in priced)
+            total_pnl_inr = sum(r["pnl_inr"] for r in priced)
+            total_cost = sum(r["qty"] * r["entry"] for r in priced if r["entry"])
+            total_pnl_pct = (total_pnl_inr / total_cost) if total_cost else 0.0
+            n_live = sum(1 for r in priced if r["is_intraday"])
+            n_priced = len(priced)
+            if n_live == n_priced:
+                basis, basis_label = "LIVE", "Indicative live P&L — Yahoo/yfinance delayed quote"
+            elif n_live == 0:
+                basis, basis_label = "EOD", f"EOD Paper P&L — NSE bhavcopy ({ctx['latest_bhavcopy_date']})"
+            else:
+                basis, basis_label = "MIXED", f"Blended P&L — {n_live}/{n_priced} live, {n_priced - n_live}/{n_priced} EOD"
+            if unpriced:
+                basis_label += f" · {len(unpriced)} unpriced row(s) excluded from total"
+            ctx["portfolio_value_display"] = _indian_rupee(total_value)
+            ctx["pnl_display"] = ("+" if total_pnl_inr >= 0 else "") + _indian_rupee(total_pnl_inr)
+            ctx["pnl_sub"] = f"{'+' if total_pnl_pct >= 0 else ''}{total_pnl_pct * 100:.2f}% · {basis_label}"
+            ctx["pnl_class"] = "up" if total_pnl_inr >= 0 else "dn"
+            ctx["pnl_basis"] = basis
+            ctx["pnl_basis_label"] = basis_label
+            # Consistency guard (operator ruling 2026-08-12, item 7): the
+            # headline is LITERALLY the sum of these same rows, so this
+            # can only fire if a future edit reintroduces a second,
+            # independent computation path -- real protective check, not
+            # decorative, verified against the rendered row list itself.
+            resum_value = sum(r["value"] for r in ctx["holdings_rows"] if r["qty"] and r["last"] is not None)
+            ctx["valuation_basis_mismatch"] = abs(resum_value - total_value) > 1.0
+        # else: no row resolved a real price this render (all EXPIRED/
+        # missing) despite n_positions>0 -- EOD-reference fallback from
+        # above stands untouched, already labeled as such.
 
     oldest = max((row["age_days"] for row in rows if row["age_days"] is not None), default=None)
     newest_date = max((row["price_as_of"] for row in rows if row["price_as_of"]), default=None)
@@ -1250,6 +1312,17 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     n_nonpass = n_gates - n_pass
     kpi_health_cls = "up" if n_pass == n_gates else ("orng" if ctx["worst_gate_status"] in ("FAIL",) else "warnc")
 
+    # 2026-08-12 operator ruling item 4: keep the EOD-basis server-computed
+    # paper_pnl visible as a labeled SECONDARY reference whenever the
+    # primary headline is not itself EOD-basis -- never hide it, just
+    # never let it be the primary number while rows show live marks.
+    eod_ref_html = ""
+    if ctx.get("pnl_basis") in ("LIVE", "MIXED"):
+        eod_ref_html = (f'<div class="chart-note">EOD reference (server-computed, {_esc(ctx["latest_bhavcopy_date"])}): '
+                         f'Portfolio Value {_esc(ctx["eod_reference_value_display"])} · '
+                         f'Paper P&amp;L {_esc(ctx["eod_reference_pnl_display"])} '
+                         f'({_esc(ctx["eod_reference_pnl_pct_display"])})</div>')
+
     kpis_html = f"""
 <div class="kpis">
   <div class="kpi"><div class="label">Portfolio Value</div><div class="value">{ctx['portfolio_value_display']}</div><div class="sub">{ctx['n_positions']} positions · equal-weight</div></div>
@@ -1258,9 +1331,17 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
   <div class="kpi"><div class="label">Drawdown</div><div class="value flat">0.00%</div><div class="sub">ref MaxDD {ctx['run148']['max_drawdown']*100:.2f}% (run_148)</div></div>
   <div class="kpi"><div class="label">Health (secondary)</div><div class="value sm {kpi_health_cls}">Clean gates: {n_pass}/{n_gates}</div><div class="sub">{_esc(ctx['gate_segments_line'])}</div></div>
   <div class="kpi"><div class="label">Material Issues</div><div class="value sm {'up' if ctx['material_issue_count']==0 else 'orng'}">{ctx['material_issue_count']}</div><div class="sub">{ctx['material_issue_count']} material to book/signal</div></div>
-</div>"""
+</div>
+{eod_ref_html}"""
 
     freshbar_html = f"""<div class="freshbar {ctx['freshness_banner_status']}">{_esc(ctx['freshness_banner_text'])}</div>"""
+    # Operator ruling 2026-08-12, item 7: structural consistency guard --
+    # fires only if a future edit reintroduces two independently-computed
+    # headline/row totals (verified against the real rendered rows, not
+    # decorative). Always False today by construction.
+    valuation_mismatch_html = ('<div class="freshbar PRICE_JOIN_FAILURE">VALUATION_BASIS_MISMATCH / REVIEW_REQUIRED — '
+                                'headline total does not match the sum of visible holdings rows.</div>'
+                                if ctx.get("valuation_basis_mismatch") else "")
     snapshot_stale_html = _snapshot_freshness_banner_html(ctx)
     active_book_pin_html = _active_book_pin_banner_html(ctx)
 
@@ -1573,6 +1654,7 @@ tick(); setInterval(tick,1000);
 {active_book_pin_html}
 {snapshot_stale_html}
 {kpis_html}
+{valuation_mismatch_html}
 {freshbar_html}
 {export_bar_html}
 {decision_html}
