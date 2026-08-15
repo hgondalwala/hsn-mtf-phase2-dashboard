@@ -694,13 +694,39 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     material = [o for o in overlap if o.get("reason") != "CA_ACKNOWLEDGED"]
     ctx["overlap_handled"] = handled
     ctx["material_issue_count"] = len(material)
-    tb = _jsonb(snap["target_book"]) or []
-    ctx["tb"] = sorted(tb, key=lambda x: x.get("rank", 999999))
-    ctx["n_symbols"] = len(tb)
+    # R27 production hotfix (operator ruling 2026-08-15): real evidence,
+    # snapshot id=8/9 (2026-08-13/14) -- a halted scanner recompute
+    # (target_book=[]) must never hide the real pinned/active holdings.
+    # The active book the dashboard shows is defined by what is actually
+    # HELD (paper_positions), enriched with today's fresh rank/score/
+    # weight/action from target_book when a fresh scanner pass exists --
+    # never gated on the scanner having run today. A halt means "no
+    # fresh rank data today", never "no active book today". Every row
+    # dict already used .get() with soft fallbacks for rank/score/
+    # weight/action, so this single redefinition fixes holdings, movers,
+    # the weight-proxy panel, and the book-impact denominator together.
+    fresh_tb = _jsonb(snap["target_book"]) or []
+    tb_by_symbol = {r.get("symbol"): r for r in fresh_tb}
+    positions_for_book = _jsonb(snap["paper_positions"]) or []
+    active_symbols = list(dict.fromkeys(
+        [p.get("symbol") for p in positions_for_book] + [r.get("symbol") for r in fresh_tb]
+    ))
+    # Always carry the full expected key set (rank/score/weight/action),
+    # defaulted to None, even for symbols with no fresh target_book entry
+    # today -- every downstream consumer of ctx["tb"] can then use plain
+    # dict access, not just .get(), without a KeyError on a halted day.
+    active_book = [
+        {"symbol": symbol, "rank": None, "score": None, "weight": None, "action": "HOLD",
+         **(tb_by_symbol.get(symbol) or {})}
+        for symbol in active_symbols
+    ]
+    ctx["tb"] = sorted(active_book, key=lambda x: x.get("rank") if x.get("rank") is not None else 999999)
+    ctx["n_symbols"] = len(active_book)
+    ctx["scanner_target_book_size"] = len(fresh_tb)  # literal, possibly-zero fresh scanner count
     ctx["book_impact_line"] = (
-        f"No unresolved material defect in target book ({len(material)}/{len(tb)} symbols affected)."
+        f"No unresolved material defect in target book ({len(material)}/{ctx['n_symbols']} symbols affected)."
         if len(material) == 0 else
-        f"{len(material)}/{len(tb)} symbols have an unresolved MATERIAL defect -- see health gates."
+        f"{len(material)}/{ctx['n_symbols']} symbols have an unresolved MATERIAL defect -- see health gates."
     )
     ctx["next_action"] = dedupe_and_humanize_next_action(snap)
     ctx["failed_gate_line"] = (humanize_failure_reason(snap["exact_failure_reason"])
@@ -1514,6 +1540,15 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     <div class="dd-block" style="grid-column:1/-1"><h4>Daily Scanner Preview — NON-ACTIONABLE ({len(ctx['daily_scanner_preview'])} symbols, as_of {_esc(ctx['as_of_date'])})</h4><div class="inner">
       <div class="chart-note">Same-day scanner recompute, kept for transparent audit only (R20). Never fed into paper actions or shown as the active book above. {'Differs from the pinned active book — see banner.' if ctx.get('scanner_preview_differs') else 'Matches the pinned active book.'}</div>
       <div style="margin-top:6px">{preview_rows}</div>
+    </div></div>"""
+    elif ctx.get("health_status") == "HALT_SIGNAL_GENERATION_REAL_FAULT":
+        # R27 (operator ruling 2026-08-15): a halt affects ONLY this
+        # scanner-preview panel -- the active holdings above are real
+        # and unaffected (see ctx["tb"] redefinition). Never silently
+        # blank; say plainly why there is nothing to preview today.
+        scanner_preview_dd = f"""
+    <div class="dd-block" style="grid-column:1/-1"><h4>Daily Scanner Preview — NON-ACTIONABLE</h4><div class="inner">
+      <div class="chart-note">No scanner book today — HALT, see health{(' (' + _esc(ctx['failed_gate_line']) + ')') if ctx.get('failed_gate_line') else ''}. The active book above is the real pinned ledger and is unaffected.</div>
     </div></div>"""
 
     drilldown_html = f"""
