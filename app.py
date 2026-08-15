@@ -273,7 +273,7 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 # app is serving stale code, this hash will not match the hash of the
 # file actually pushed -- a real, checkable signal, not a hardcoded claim.
 _BUILD_TAG = "step6p-v1"
-_BUILD_TIMESTAMP_IST = "2026-08-11 12:11 IST"
+_BUILD_TIMESTAMP_IST = "2026-08-15 11:13 IST"
 
 # R20 (operator ruling 2026-08-11, third recurrence of two-repo drift):
 # the footer must show the dashboard-repo build identity (already
@@ -288,7 +288,7 @@ _BUILD_TIMESTAMP_IST = "2026-08-11 12:11 IST"
 # Manually updated to the real `git rev-parse HEAD` of the main repo
 # immediately before each sync to this deploy repo -- same "hardcoded,
 # deliberately updated per deploy" pattern as _BUILD_TIMESTAMP_IST above.
-_MAIN_REPO_SOURCE_COMMIT = "4b94b9ab00861e1ce7c8adf5419a72d4550bd005"
+_MAIN_REPO_SOURCE_COMMIT = "25011207fa8a8f2995b4b7c0cf22e9b57adcc9fb"
 
 # R13 (operator ruling 2026-08-10): the public URL was previously not
 # recorded anywhere, causing a real verification gap mid-investigation
