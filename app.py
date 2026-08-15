@@ -74,6 +74,12 @@ RANK_BAND_EDGE_BUFFER = 50
 # quote (see PHASE2_DASH_LIVE_PRICE_FRESHNESS_ADDENDUM.md Section 3).
 PRICE_FRESH_MAX_DAYS = 3
 PRICE_DELAYED_MAX_DAYS = 7
+# R35 (operator ruling 2026-08-15): the headline Portfolio Value (Σ real
+# row values) must reconcile against paper_ledger.py::compute_paper_pnl()'s
+# independently-computed market_value (same bhavcopy-latest-close join,
+# confirmed exact-to-the-cent against real production data) -- ₹10 is
+# generous headroom over that observed exact match, not a loose bound.
+VALUATION_RECON_TOLERANCE_INR = 10.0
 # R16 (operator ruling 2026-08-10): PRICE_SOURCE_LABEL describes the
 # bhavcopy FILE's own granularity (it is an EOD file, always was) -- it
 # must never claim anything about whether THIS SYSTEM has an intraday
@@ -273,7 +279,7 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 # app is serving stale code, this hash will not match the hash of the
 # file actually pushed -- a real, checkable signal, not a hardcoded claim.
 _BUILD_TAG = "step6p-v1"
-_BUILD_TIMESTAMP_IST = "2026-08-15 12:09 IST"
+_BUILD_TIMESTAMP_IST = "2026-08-15 13:38 IST"
 
 # R20 (operator ruling 2026-08-11, third recurrence of two-repo drift):
 # the footer must show the dashboard-repo build identity (already
@@ -288,7 +294,7 @@ _BUILD_TIMESTAMP_IST = "2026-08-15 12:09 IST"
 # Manually updated to the real `git rev-parse HEAD` of the main repo
 # immediately before each sync to this deploy repo -- same "hardcoded,
 # deliberately updated per deploy" pattern as _BUILD_TIMESTAMP_IST above.
-_MAIN_REPO_SOURCE_COMMIT = "dd6a42b69a70a87e98191cf1ab582d677d06474d"
+_MAIN_REPO_SOURCE_COMMIT = "5d65d7d4a950864ffc08c8bc26445cbd1554d38e"
 
 # R13 (operator ruling 2026-08-10): the public URL was previously not
 # recorded anywhere, causing a real verification gap mid-investigation
@@ -671,13 +677,38 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
                                  if entry_date_disp else "entry-to-current mark (entry date not yet available)")
     eod_pnl_inr = pnl.get("cumulative_pnl_inr", 0) or 0
     eod_pnl_pct = pnl.get("cumulative_pnl_pct", 0) or 0
+    # R35 fix (operator ruling 2026-08-15, real evidence: headline
+    # Portfolio Value ₹15,12,156 vs a reported "row sum" ₹15,16,924, diff
+    # ₹4,768). Root cause: total_equity = cash + market_value (real
+    # paper_ledger.py::compute_paper_pnl(), line 314) -- cash (₹4,767.60,
+    # real uninvested shadow-ledger residual) is a legitimate component
+    # of total ACCOUNT equity, but "Portfolio Value" (KPI sub: "N
+    # positions · equal-weight") means the value of the 15 positions
+    # only. market_value uses the exact same bhavcopy-latest-close join
+    # as the dashboard's own row pricing (confirmed exact-to-the-cent
+    # against real production data) -- it is the correct, apples-to-
+    # apples fallback/ground-truth for "Portfolio Value", never
+    # total_equity. ctx["eod_reference_*"] (total_equity/cumulative_pnl,
+    # both cash-inclusive, self-consistent with EACH OTHER) is kept
+    # separately for the secondary "Total Account Equity" reference line
+    # -- never blended with the positions-only Portfolio Value KPI.
+    ctx["market_value_display"] = _indian_rupee(pnl.get("market_value", pnl.get("total_equity")))
+    ctx["cash_display"] = _indian_rupee(pnl.get("cash"))
+    ctx["total_account_equity_display"] = _indian_rupee(pnl.get("total_equity"))
     ctx["eod_reference_value_display"] = _indian_rupee(pnl.get("total_equity"))
     ctx["eod_reference_pnl_display"] = ("+" if eod_pnl_inr >= 0 else "") + _indian_rupee(eod_pnl_inr)
     ctx["eod_reference_pnl_pct_display"] = f"{'+' if eod_pnl_pct >= 0 else ''}{eod_pnl_pct * 100:.2f}%"
+    # R35 defaults: overwritten below only when the real per-row
+    # reconciliation actually runs (n_positions>0, no price_load_error,
+    # at least one row priced) -- OK by default so a render that never
+    # reaches that block (e.g. n_positions==0) never shows a false
+    # mismatch banner.
+    ctx["valuation_recon_status"] = "OK"
+    ctx["valuation_recon_detail"] = ""
     if ctx["n_positions"] == 0:
         # No real fills yet -- nothing to reconcile against, EOD/live
         # basis distinction is moot.
-        ctx["portfolio_value_display"] = ctx["eod_reference_value_display"]
+        ctx["portfolio_value_display"] = ctx["market_value_display"]
         ctx["pnl_display"] = "Ledger pending"
         ctx["pnl_sub"] = "no fills yet, 0 open positions"
         ctx["pnl_class"] = "flat"
@@ -688,7 +719,7 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
         # Placeholder until the reconciled headline is computed below,
         # once holdings_rows exist -- overwritten unconditionally further
         # down for every n_positions>0 case (never left as this fallback).
-        ctx["portfolio_value_display"] = ctx["eod_reference_value_display"]
+        ctx["portfolio_value_display"] = ctx["market_value_display"]
         ctx["pnl_display"] = ctx["eod_reference_pnl_display"]
         ctx["pnl_sub"] = ctx["eod_reference_pnl_pct_display"]
         ctx["pnl_class"] = "up" if eod_pnl_inr >= 0 else "dn"
@@ -965,6 +996,28 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
             # decorative, verified against the rendered row list itself.
             resum_value = sum(r["value"] for r in ctx["holdings_rows"] if r["qty"] and r["last"] is not None)
             ctx["valuation_basis_mismatch"] = abs(resum_value - total_value) > 1.0
+
+            # R35 (operator ruling 2026-08-15): independent cross-check
+            # against paper_ledger.py's own server-computed market_value
+            # (real evidence: exact-to-the-cent match against production
+            # data) -- catches a FUTURE regression where the row-sum and
+            # the real ledger's own valuation genuinely diverge (a real
+            # data defect), as distinct from the R33/R34 fixes above
+            # (which only guaranteed internal self-consistency of this
+            # render's own numbers, not agreement with an independent
+            # source). Skipped, not falsely flagged, when: market_value
+            # isn't present in this snapshot's paper_pnl (older shape),
+            # or any row is unpriced (a real, already-disclosed gap that
+            # legitimately explains a lower row-sum, not a mismatch).
+            ledger_market_value = pnl.get("market_value")
+            if ledger_market_value is not None and not unpriced:
+                recon_diff = total_value - float(ledger_market_value)
+                if abs(recon_diff) > VALUATION_RECON_TOLERANCE_INR:
+                    ctx["valuation_recon_status"] = "VALUATION_RECON_MISMATCH"
+                    ctx["valuation_recon_detail"] = (
+                        f"headline/row total {_indian_rupee(total_value)} vs ledger market_value "
+                        f"{_indian_rupee(ledger_market_value)} — diff {_indian_rupee(recon_diff)}"
+                    )
         # else: no row resolved a real price this render (all EXPIRED/
         # missing) despite n_positions>0 -- EOD-reference fallback from
         # above stands untouched, already labeled as such.
@@ -1444,10 +1497,27 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     # never let it be the primary number while rows show live marks.
     eod_ref_html = ""
     if ctx.get("pnl_basis") in ("LIVE", "MIXED"):
+        # R35 relabel (operator ruling 2026-08-15): this line is
+        # total_equity/cumulative_pnl_inr -- cash-inclusive, self-
+        # consistent with EACH OTHER -- and must never be captioned
+        # "Portfolio Value" (that label means the 15 positions only,
+        # see ctx["portfolio_value_display"] above). Renamed "Total
+        # Account Equity" so the two concepts can never be misread as
+        # the same quantity again.
         eod_ref_html = (f'<div class="chart-note">EOD reference (server-computed, {_esc(ctx["latest_bhavcopy_date"])}): '
-                         f'Portfolio Value {_esc(ctx["eod_reference_value_display"])} · '
-                         f'Paper P&amp;L {_esc(ctx["eod_reference_pnl_display"])} '
+                         f'Total Account Equity {_esc(ctx["eod_reference_value_display"])} · '
+                         f'Ledger P&amp;L {_esc(ctx["eod_reference_pnl_display"])} '
                          f'({_esc(ctx["eod_reference_pnl_pct_display"])})</div>')
+
+    # R35 (operator ruling 2026-08-15): explicit, always-visible cash
+    # disclosure so "why does Total Account Equity differ from Portfolio
+    # Value" is answered directly on the page, not left for a reader (or
+    # an automated checker) to mistake for a reconciliation defect.
+    cash_reference_html = ""
+    if ctx["n_positions"] > 0 and ctx.get("cash_display") not in (None, "n/a"):
+        cash_reference_html = (f'<div class="chart-note">+ Cash {_esc(ctx["cash_display"])} '
+                                f'&rarr; Total Account Equity {_esc(ctx["total_account_equity_display"])} '
+                                f'(reference only — not part of Portfolio Value above)</div>')
 
     kpis_html = f"""
 <div class="kpis">
@@ -1458,7 +1528,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
   <div class="kpi"><div class="label">Health (secondary)</div><div class="value sm {kpi_health_cls}">Clean gates: {n_pass}/{n_gates}</div><div class="sub">{_esc(ctx['gate_segments_line'])}</div></div>
   <div class="kpi"><div class="label">Material Issues</div><div class="value sm {'up' if ctx['material_issue_count']==0 else 'orng'}">{ctx['material_issue_count']}</div><div class="sub">{ctx['material_issue_count']} material to book/signal</div></div>
 </div>
-{eod_ref_html}"""
+{cash_reference_html}{eod_ref_html}"""
 
     freshbar_html = f"""<div class="freshbar {ctx['freshness_banner_status']}">{_esc(ctx['freshness_banner_text'])}</div>"""
     # Operator ruling 2026-08-12, item 7: structural consistency guard --
@@ -1468,6 +1538,14 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     valuation_mismatch_html = ('<div class="freshbar PRICE_JOIN_FAILURE">VALUATION_BASIS_MISMATCH / REVIEW_REQUIRED — '
                                 'headline total does not match the sum of visible holdings rows.</div>'
                                 if ctx.get("valuation_basis_mismatch") else "")
+    # R35 (operator ruling 2026-08-15): a SEPARATE, real check against an
+    # independent source (paper_ledger.py's own server-computed
+    # market_value, not just this render's internal self-consistency
+    # above) -- fires only on a genuine future divergence between the
+    # dashboard's row-level pricing and the real ledger's own valuation.
+    valuation_recon_html = ('<div class="freshbar PRICE_JOIN_FAILURE">VALUATION_RECON_MISMATCH / REVIEW_REQUIRED — '
+                             f'{_esc(ctx.get("valuation_recon_detail", ""))}</div>'
+                             if ctx.get("valuation_recon_status") == "VALUATION_RECON_MISMATCH" else "")
     snapshot_stale_html = _snapshot_freshness_banner_html(ctx)
     active_book_pin_html = _active_book_pin_banner_html(ctx)
 
@@ -1790,6 +1868,7 @@ tick(); setInterval(tick,1000);
 {snapshot_stale_html}
 {kpis_html}
 {valuation_mismatch_html}
+{valuation_recon_html}
 {freshbar_html}
 {export_bar_html}
 {decision_html}
