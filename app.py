@@ -273,7 +273,7 @@ def classify_intraday_freshness(quote_ts, now_utc=None) -> tuple:
 # app is serving stale code, this hash will not match the hash of the
 # file actually pushed -- a real, checkable signal, not a hardcoded claim.
 _BUILD_TAG = "step6p-v1"
-_BUILD_TIMESTAMP_IST = "2026-08-15 11:13 IST"
+_BUILD_TIMESTAMP_IST = "2026-08-15 12:09 IST"
 
 # R20 (operator ruling 2026-08-11, third recurrence of two-repo drift):
 # the footer must show the dashboard-repo build identity (already
@@ -288,7 +288,7 @@ _BUILD_TIMESTAMP_IST = "2026-08-15 11:13 IST"
 # Manually updated to the real `git rev-parse HEAD` of the main repo
 # immediately before each sync to this deploy repo -- same "hardcoded,
 # deliberately updated per deploy" pattern as _BUILD_TIMESTAMP_IST above.
-_MAIN_REPO_SOURCE_COMMIT = "25011207fa8a8f2995b4b7c0cf22e9b57adcc9fb"
+_MAIN_REPO_SOURCE_COMMIT = "dd6a42b69a70a87e98191cf1ab582d677d06474d"
 
 # R13 (operator ruling 2026-08-10): the public URL was previously not
 # recorded anywhere, causing a real verification gap mid-investigation
@@ -587,6 +587,26 @@ def _esc(s) -> str:
     return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def _pinned_active_symbols(snap: dict) -> list:
+    """R33 fix (operator ruling 2026-08-15, real evidence: bhavcopy
+    2026-08-14 was ingested but 0/15 pinned holdings had a price row on
+    the live dashboard). The real active/pinned book is paper_positions
+    (what is actually held) unioned with today's fresh target_book
+    (paper_positions first, so a halted scanner day never reorders the
+    held book) -- SAME definition build_dashboard_context() uses for
+    ctx["tb"]. Single source of truth so the DB price-query symbol list
+    (main()) can never drift from the rendered holdings list again: the
+    R33 defect was exactly this drift -- main() queried target_book-only
+    symbols while ctx["tb"] (post-R27) already showed the full pinned
+    book, so every pinned-only row's Last/Value/P&L/movers/weight-proxy
+    silently had no price to join against."""
+    fresh_tb = _jsonb(snap["target_book"]) or []
+    positions = _jsonb(snap["paper_positions"]) or []
+    return list(dict.fromkeys(
+        [p.get("symbol") for p in positions] + [r.get("symbol") for r in fresh_tb]
+    ))
+
+
 # ---------------------------------------------------------------------------
 # Context builder -- computes every real value the template needs, once,
 # from the real snapshot + real price queries + the real bundled run_148
@@ -637,6 +657,18 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     pnl = _jsonb(snap["paper_pnl"]) or {}
     ctx["pnl"] = pnl
     ctx["n_positions"] = pnl.get("n_positions", 0)
+    # R34 fix (operator ruling 2026-08-15): the headline previously read
+    # "since {as_of_date}" (the snapshot's publish date), which drifts
+    # forward every single day regardless of when the real position was
+    # actually opened -- a real mislabeling, not a computation bug. Both
+    # the row-level P&L (last_price - entry, entry = real avg_cost) and
+    # the server-side paper_ledger.py figure (total_equity - the real
+    # initial_capital fixed at inception) were ALREADY entry-anchored;
+    # only the disclosed anchor date was wrong. active_book_pin's real
+    # entry_date (paper_ledger_entry_date) is the correct anchor.
+    entry_date_disp = ctx["active_book_pin"].get("entry_date")
+    ctx["pnl_anchor_label"] = (f"entry-to-current mark since {entry_date_disp}"
+                                 if entry_date_disp else "entry-to-current mark (entry date not yet available)")
     eod_pnl_inr = pnl.get("cumulative_pnl_inr", 0) or 0
     eod_pnl_pct = pnl.get("cumulative_pnl_pct", 0) or 0
     ctx["eod_reference_value_display"] = _indian_rupee(pnl.get("total_equity"))
@@ -707,16 +739,24 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     # the weight-proxy panel, and the book-impact denominator together.
     fresh_tb = _jsonb(snap["target_book"]) or []
     tb_by_symbol = {r.get("symbol"): r for r in fresh_tb}
-    positions_for_book = _jsonb(snap["paper_positions"]) or []
-    active_symbols = list(dict.fromkeys(
-        [p.get("symbol") for p in positions_for_book] + [r.get("symbol") for r in fresh_tb]
-    ))
+    active_symbols = _pinned_active_symbols(snap)
+    # R33 fix (operator ruling 2026-08-15): rank/score have no honest
+    # fallback (they require a real scanner recompute), so they stay
+    # None on a halted day -- but weight DOES have one. This book is
+    # equal-weight BY CONSTRUCTION (run_eod_pipeline_production.py's own
+    # target_book builder always sets weight=round(1.0/n_fresh, 4),
+    # never anything else), so "1/n of the real, currently-held book" is
+    # not an estimate -- it is the exact same deterministic value the
+    # scanner would have written had it run today. Without this, every
+    # halted-day P&L-contribution/allocation panel silently rendered
+    # weight=None * equity = 0 for all 15 real positions (R33).
+    fallback_weight = round(1.0 / len(active_symbols), 4) if active_symbols else None
     # Always carry the full expected key set (rank/score/weight/action),
     # defaulted to None, even for symbols with no fresh target_book entry
     # today -- every downstream consumer of ctx["tb"] can then use plain
     # dict access, not just .get(), without a KeyError on a halted day.
     active_book = [
-        {"symbol": symbol, "rank": None, "score": None, "weight": None, "action": "HOLD",
+        {"symbol": symbol, "rank": None, "score": None, "weight": fallback_weight, "action": "HOLD",
          **(tb_by_symbol.get(symbol) or {})}
         for symbol in active_symbols
     ]
@@ -987,7 +1027,7 @@ def build_dashboard_context(snap: dict, latest_prices: dict, signal_prices: dict
     elif oldest is None and not intraday_really_active:
         ctx["freshness_banner_status"] = "STALE"
         ctx["freshness_banner_text"] = (
-            "PRICE DATA STALE — no real bhavcopy row found for any target-book symbol. "
+            "PRICE DATA STALE — no real bhavcopy row found for any pinned book symbol. "
             f"EOD close only — intraday quote plane not active · {market_phrase}.")
     elif intraday_really_active:
         worst_status = "EXPIRED" if n_intraday_expired else ("STALE" if ctx["n_stale"] else "FRESH")
@@ -1412,7 +1452,7 @@ def render_dash3_html(ctx: dict, dev_mode: bool = False) -> str:
     kpis_html = f"""
 <div class="kpis">
   <div class="kpi"><div class="label">Portfolio Value</div><div class="value">{ctx['portfolio_value_display']}</div><div class="sub">{ctx['n_positions']} positions · equal-weight</div></div>
-  <div class="kpi"><div class="label">Paper P&amp;L</div><div class="value {ctx['pnl_class']}">{ctx['pnl_display']}</div><div class="sub">{_esc(ctx['pnl_sub'])} · since {_esc(ctx['as_of_date'])}</div></div>
+  <div class="kpi"><div class="label">Paper P&amp;L</div><div class="value {ctx['pnl_class']}">{ctx['pnl_display']}</div><div class="sub">{_esc(ctx['pnl_sub'])}{' · ' + _esc(ctx['pnl_anchor_label']) if ctx['n_positions'] else ''}</div></div>
   <div class="kpi"><div class="label">Positions</div><div class="value">{ctx['n_positions']}</div><div class="sub">{ctx['n_symbols']} in book</div></div>
   <div class="kpi"><div class="label">Drawdown</div><div class="value flat">0.00%</div><div class="sub">ref MaxDD {ctx['run148']['max_drawdown']*100:.2f}% (run_148)</div></div>
   <div class="kpi"><div class="label">Health (secondary)</div><div class="value sm {kpi_health_cls}">Clean gates: {n_pass}/{n_gates}</div><div class="sub">{_esc(ctx['gate_segments_line'])}</div></div>
@@ -1671,7 +1711,7 @@ const MOVES={moves_json};
 (function(){{
   const g=document.getElementById('gainers'), l=document.getElementById('losers');
   if(!MOVES.length){{
-    document.querySelector('.movers-wrap').innerHTML='<div class="movers-note" style="padding:20px;text-align:center">No real bhavcopy row pair (latest + prior trading day) yet for any target-book symbol.</div>';
+    document.querySelector('.movers-wrap').innerHTML='<div class="movers-note" style="padding:20px;text-align:center">No real bhavcopy row pair (latest + prior trading day) yet for any pinned book symbol.</div>';
   }} else {{
     MOVES.slice(0,3).forEach(m=>{{g.insertAdjacentHTML('beforeend',`<div class="mrow"><span class="ms">${{m.symbol}}</span><span class="mv up">+${{m.pct.toFixed(2)}}%</span></div>`);}});
     MOVES.slice(-3).reverse().forEach(m=>{{l.insertAdjacentHTML('beforeend',`<div class="mrow"><span class="ms">${{m.symbol}}</span><span class="mv dn">${{m.pct.toFixed(2)}}%</span></div>`);}});
@@ -1680,7 +1720,7 @@ const MOVES={moves_json};
 
 /* rank distribution -- real book ranks only (no fabricated universe-wide shape) */
 (function(){{
-  const sorted=[...TB].sort((a,b)=>a.rank-b.rank);
+  const sorted=TB.filter(r=>r.rank!=null).sort((a,b)=>a.rank-b.rank);
   echarts.init(document.getElementById('rankHist')).setOption({{
     backgroundColor:'transparent',tooltip:TT,grid:{{left:8,right:12,top:14,bottom:40,containLabel:true}},
     xAxis:{{type:'category',data:sorted.map(r=>r.symbol),name:'book, real ranks only',nameTextStyle:{{color:'#5a6377',fontSize:9}},...AX,axisLabel:{{...AX.axisLabel,rotate:45}}}},
@@ -1908,7 +1948,14 @@ def main():
     else:
         st.session_state["last_good_snapshot"] = snap
 
-    tb_symbols = [r.get("symbol") for r in (_jsonb(snap["target_book"]) or [])]
+    # R33 fix (operator ruling 2026-08-15): query prices for the real
+    # pinned/active book (paper_positions unioned with today's fresh
+    # target_book), not target_book alone -- see _pinned_active_symbols()
+    # docstring. Before this fix, a halted scanner day (target_book=[])
+    # meant these DB queries ran with an empty symbol list, so every
+    # pinned holding's Last/Value/P&L/movers/weight-proxy silently had
+    # nothing to join against even though real bhavcopy rows existed.
+    tb_symbols = _pinned_active_symbols(snap)
     price_t0 = time.monotonic()
     market_open, _now_ist = _nse_market_open()
     price_load_error = None
